@@ -1,8 +1,9 @@
 """
-Celery worker tasks for async document extraction.
-"""
-import asyncio
+Celery worker tasks for document extraction (long-term stable).
 
+- Celery tasks remain synchronous.
+- DB updates use sync SQLAlchemy (psycopg/psycopg2) to avoid asyncpg issues.
+"""
 from celery import Celery
 
 from app.settings import get_settings
@@ -44,26 +45,20 @@ def extract_task(
     supplier_id: str = None,
     filename: str = None,
 ):
-    """
-    Celery task that runs the full extraction pipeline.
-    file_b64: base64-encoded file bytes.
-    """
     import base64
 
     log = logger.bind(job_id=job_id, document_id=document_id)
 
-    # Import here to avoid circular imports at module level
     from app.pipeline.orchestrator import run_extraction_pipeline
-    from app.storage.queries import update_job_status
-
-    async def _update(status, error=None):
-        await update_job_status(job_id, status, error)
+    from app.storage.queries_sync import update_job_status_sync
 
     try:
         log.info("task_started")
-        asyncio.run(_update("processing"))
+        update_job_status_sync(job_id, "processing")
 
         file_bytes = base64.b64decode(file_b64)
+
+        # Pipeline is sync -> keep it sync in Celery
         result = run_extraction_pipeline(
             file_bytes=file_bytes,
             document_id=document_id,
@@ -73,11 +68,15 @@ def extract_task(
             filename=filename,
         )
 
-        asyncio.run(_update("completed"))
+        update_job_status_sync(job_id, "completed")
         log.info("task_completed")
         return result.model_dump(mode="json")
 
     except Exception as exc:
         log.error("task_failed", error=str(exc), exc_info=True)
-        asyncio.run(_update("failed", error=str(exc)))
+
+        # Mark failed only after retries exhausted; otherwise keep it retrying.
+        if self.request.retries >= self.max_retries:
+            update_job_status_sync(job_id, "failed", error=str(exc))
+
         raise self.retry(exc=exc)

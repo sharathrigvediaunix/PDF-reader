@@ -126,7 +126,7 @@ def ocr_image(
         ))
         lines_text.setdefault(line_id, []).append(word)
 
-    full_text = "\n".join(" ".join(words) for words in sorted(lines_text.items()))
+    full_text = "\n".join(" ".join(map(str, words)) for _, words in sorted(lines_text.items()))
 
     logger.info("ocr_complete", page_no=page_no, token_count=len(tokens))
     return NormalizedPage(
