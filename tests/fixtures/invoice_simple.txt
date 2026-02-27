@@ -1,0 +1,10 @@
+
+Simple Invoice
+
+invoice number: SI-003
+invoice date: 2024-03-20
+
+vendor: Quick Services LLC
+customer: Beta Company
+
+total due: $500.00

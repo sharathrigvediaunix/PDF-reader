@@ -1,0 +1,228 @@
+# Field configuration for document_type: invoice
+# Each field: type, required, patterns[], anchors[], search_window,
+#             normalizers[], validators[], fallback_allowed
+
+document_type: invoice
+
+fields:
+  invoice_number:
+    type: string
+    required: true
+    anchors:
+      - "invoice number"
+      - "invoice no"
+      - "invoice #"
+      - "inv no"
+      - "inv #"
+      - "invoice num"
+    patterns:
+      - '(?:invoice\s*(?:number|no|#|num)[:\s#]*)([\w\-/]+)'
+      - '(?:inv\s*(?:no|#)[:\s#]*)([\w\-/]+)'
+      - '\b(INV[\-\s]?\d{4,})\b'
+      - '\b([A-Z]{2,4}[\-/]\d{4,})\b'
+    search_window: same_line_or_next
+    normalizers:
+      - strip
+      - upper
+    validators:
+      - min_length:3
+      - max_length:50
+    fallback_allowed: true
+
+  invoice_date:
+    type: date
+    required: true
+    anchors:
+      - "invoice date"
+      - "date"
+      - "date of invoice"
+      - "billing date"
+      - "issue date"
+    patterns:
+      - '(?:invoice\s*date|billing\s*date|issue\s*date|date)[:\s]+(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})'
+      - '(?:invoice\s*date|date)[:\s]+(\w+ \d{1,2},?\s*\d{4})'
+      - '\b(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{4})\b'
+      - '\b(\d{4}[\/\-]\d{2}[\/\-]\d{2})\b'
+    search_window: same_line_or_next
+    normalizers:
+      - strip
+      - parse_date
+    validators:
+      - valid_date
+      - not_future
+    fallback_allowed: true
+
+  due_date:
+    type: date
+    required: false
+    anchors:
+      - "due date"
+      - "payment due"
+      - "pay by"
+      - "payment terms"
+    patterns:
+      - '(?:due\s*date|payment\s*due|pay\s*by)[:\s]+(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})'
+      - '(?:due\s*date|payment\s*due)[:\s]+(\w+ \d{1,2},?\s*\d{4})'
+    search_window: same_line_or_next
+    normalizers:
+      - strip
+      - parse_date
+    validators:
+      - valid_date
+    fallback_allowed: true
+
+  vendor_name:
+    type: string
+    required: true
+    anchors:
+      - "from"
+      - "vendor"
+      - "seller"
+      - "bill from"
+      - "company name"
+    patterns:
+      - '(?:from|vendor|seller|bill\s*from)[:\s]+([^\n]+)'
+    search_window: same_line_or_next
+    normalizers:
+      - strip
+      - title_case
+    validators:
+      - min_length:2
+    fallback_allowed: true
+
+  vendor_address:
+    type: address
+    required: false
+    anchors:
+      - "address"
+      - "from"
+      - "vendor address"
+    patterns:
+      - '(\d+\s+[\w\s]+(?:street|st|avenue|ave|road|rd|blvd|boulevard|lane|ln|drive|dr)[^\n]*)'
+    search_window: next_3_lines
+    normalizers:
+      - strip
+    validators:
+      - min_length:5
+    fallback_allowed: true
+
+  customer_name:
+    type: string
+    required: false
+    anchors:
+      - "bill to"
+      - "to"
+      - "customer"
+      - "client"
+      - "sold to"
+    patterns:
+      - '(?:bill\s*to|sold\s*to|customer|client)[:\s]+([^\n]+)'
+    search_window: same_line_or_next
+    normalizers:
+      - strip
+      - title_case
+    validators:
+      - min_length:2
+    fallback_allowed: true
+
+  subtotal:
+    type: money
+    required: false
+    anchors:
+      - "subtotal"
+      - "sub total"
+      - "sub-total"
+    patterns:
+      - '(?:subtotal|sub\s*total|sub-total)[:\s]+\$?([\d,]+\.?\d{0,2})'
+    search_window: same_line_right
+    normalizers:
+      - strip
+      - parse_money
+    validators:
+      - positive_number
+    fallback_allowed: true
+
+  tax_amount:
+    type: money
+    required: false
+    anchors:
+      - "tax"
+      - "vat"
+      - "gst"
+      - "hst"
+      - "sales tax"
+    patterns:
+      - '(?:tax|vat|gst|hst|sales\s*tax)[:\s\(0-9%]+\$?([\d,]+\.?\d{0,2})'
+      - '(?:tax|vat)[:\s]+\$?([\d,]+\.\d{2})'
+    search_window: same_line_right
+    normalizers:
+      - strip
+      - parse_money
+    validators:
+      - positive_number
+    fallback_allowed: true
+
+  total_amount:
+    type: money
+    required: true
+    anchors:
+      - "total"
+      - "amount due"
+      - "total amount"
+      - "balance due"
+      - "grand total"
+      - "total due"
+    patterns:
+      - '(?:total\s*amount|grand\s*total|amount\s*due|balance\s*due|total\s*due|total)[:\s]+\$?([\d,]+\.?\d{0,2})'
+      - '\$\s*([\d,]+\.\d{2})\s*(?:total|due)'
+    search_window: same_line_right
+    normalizers:
+      - strip
+      - parse_money
+    validators:
+      - positive_number
+    fallback_allowed: true
+
+  currency:
+    type: string
+    required: false
+    anchors: []
+    patterns:
+      - '\b(USD|EUR|GBP|CAD|AUD|JPY|CHF|INR)\b'
+      - '(?<!\w)(\$)(?=[\d\s])'
+    search_window: full_text
+    normalizers:
+      - strip
+      - upper
+    validators: []
+    fallback_allowed: false
+
+  payment_terms:
+    type: string
+    required: false
+    anchors:
+      - "payment terms"
+      - "terms"
+      - "net"
+    patterns:
+      - '(?:payment\s*terms|terms)[:\s]+((?:net\s*)?\d+\s*(?:days?)?[^\n]*)'
+      - '\b(net\s*\d+)\b'
+    search_window: same_line_or_next
+    normalizers:
+      - strip
+    validators: []
+    fallback_allowed: true
+
+cross_field_validations:
+  - name: total_gte_tax
+    description: Total amount must be >= tax amount
+    fields: [total_amount, tax_amount]
+    rule: total_amount >= tax_amount
+  - name: total_gte_subtotal
+    description: Total amount must be >= subtotal
+    fields: [total_amount, subtotal]
+    rule: total_amount >= subtotal
+  - name: due_after_invoice
+    description: Due date should not be before invoice date
+    fields: [invoice_date, due_date]
+    rule: due_date >= invoice_date

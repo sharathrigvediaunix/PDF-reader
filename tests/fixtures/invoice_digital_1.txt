@@ -1,0 +1,29 @@
+
+INVOICE
+
+Vendor: Acme Supplies Inc.
+123 Commerce Street, Suite 400
+New York, NY 10001
+
+Bill To:
+TechCorp Ltd.
+456 Innovation Avenue
+San Francisco, CA 94107
+
+Invoice Number: INV-2024-001
+Invoice Date: 01/15/2024
+Due Date: 02/15/2024
+Payment Terms: Net 30
+
+Description                          Qty    Unit Price    Amount
+-------------------------------------------------------------------
+Software Licenses (Annual)            5      $500.00     $2,500.00
+Support Services                      1      $750.00       $750.00
+Implementation Consulting             8      $150.00     $1,200.00
+
+                                               Subtotal:  $4,450.00
+                                               Tax (10%):   $445.00
+                                         Total Amount:  $4,895.00
+
+Payment due by: February 15, 2024
+Please make checks payable to: Acme Supplies Inc.

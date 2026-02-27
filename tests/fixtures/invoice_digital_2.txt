@@ -1,0 +1,28 @@
+
+TAX INVOICE
+
+FROM:
+Global Tech Solutions
+789 Enterprise Blvd
+Austin, TX 78701
+Phone: (512) 555-0100
+
+TO:
+Midwest Distribution Co.
+321 Warehouse Road
+Chicago, IL 60601
+
+Inv # GTS-20240203
+Date: February 3, 2024
+Payment Due: March 4, 2024
+
+ITEMS:
+Hardware Components          $8,200.00
+Shipping & Handling            $125.00
+Discount                      -$400.00
+
+Sub Total: $7,925.00
+Sales Tax (8.5%): $673.63
+Grand Total: $8,598.63
+
+Currency: USD
