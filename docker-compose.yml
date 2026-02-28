@@ -64,6 +64,7 @@ services:
       LLM_CONFIDENCE_THRESHOLD: "0.5"
     volumes:
       - ./app:/app/app
+      - ./logs:/app/logs
     depends_on:
       postgres:
         condition: service_healthy
@@ -90,6 +91,7 @@ services:
       LLM_CONFIDENCE_THRESHOLD: "0.5"
     volumes:
       - ./app:/app/app
+      - ./logs:/app/logs
     depends_on:
       postgres:
         condition: service_healthy

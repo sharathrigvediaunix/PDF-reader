@@ -17,6 +17,7 @@ class Settings(BaseSettings):
     llm_confidence_threshold: float = 0.5
     cloud_llm_api_key: str = ""
     cloud_llm_provider: str = ""  # "openai" or "anthropic"
+    log_dir: str = "/app/logs"
 
     class Config:
         env_file = ".env"
