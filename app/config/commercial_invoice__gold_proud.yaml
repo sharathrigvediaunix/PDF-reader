@@ -1,0 +1,48 @@
+document_type: commercial_invoice
+
+fields:
+  invoice_number:
+    type: string
+    required: true
+    anchors: ["INV NO", "INV NO.", "INVOICE NO", "INVOICE #"]
+    patterns:
+      - '(?i)\bGP-\d{1,4}\/\d{4}\b'
+    search_window: "any_direction_near_anchor"
+    normalizers: ["strip", "upper"]
+    validators: ["min_len:6"]
+    fallback_allowed: false
+
+  po_numbers:
+    type: string_list
+    required: false
+    anchors: ["PO NO", "PO NO.", "PO #"]
+    patterns:
+      - '\b\d{6}\b'
+    search_window: "any_direction_near_anchor"
+    normalizers: ["strip"]
+    validators: []
+    fallback_allowed: false
+    # (Your current loader ignores these unless you add them)
+    mode: multi
+    scan: both
+    dedupe: true
+
+table:
+  header_keywords: ["PO #", "Item #", "Description", "Qty", "Unit Price", "Amount"]
+  stop_keywords: ["TOTAL", "Bank Info"]
+  columns:
+    - name: po_number
+      type: string
+      patterns: ['^\d{6}$']
+    - name: item_number
+      type: string
+      patterns: ['^[A-Z0-9]{6,}$']
+    - name: qty
+      type: int
+      patterns: ['^\d+$']
+    - name: unit_price
+      type: money
+      patterns: ['^\$?[0-9,]+\.\d{2}$']
+    - name: amount
+      type: money
+      patterns: ['^\$?[0-9,]+\.\d{2}$']

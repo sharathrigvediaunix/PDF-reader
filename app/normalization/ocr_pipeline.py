@@ -1,13 +1,15 @@
 """
-OCR pipeline: preprocess image -> run Tesseract -> return NormalizedPage with token bboxes.
+OCR pipeline: preprocess image -> PaddleOCR -> NormalizedPage with token bboxes.
+PaddleOCR replaces Tesseract for better accuracy on structured documents,
+tables, and mixed-language content (e.g. Chinese + English invoices).
 """
+
 import io
 import math
 from typing import Optional
 
 import cv2
 import numpy as np
-import pytesseract
 from PIL import Image
 
 from app.models import NormalizedPage, Token, BBox
@@ -15,10 +17,38 @@ from app.logging_config import get_logger
 
 logger = get_logger("ocr")
 
+# PaddleOCR is imported lazily to avoid slow startup when not needed
+_paddle_ocr = None
+
+
+def _get_paddle_ocr():
+    """Lazy-load PaddleOCR engine (expensive to initialize)."""
+    global _paddle_ocr
+    if _paddle_ocr is None:
+        try:
+            from paddleocr import PaddleOCR
+
+            # use_angle_cls: auto-rotate detected text blocks
+            # lang: en covers most invoice content; add 'ch' for Chinese
+            # use_gpu: set True if GPU available
+            _paddle_ocr = PaddleOCR(
+                use_angle_cls=True,
+                lang="en",
+                use_gpu=False,
+                show_log=False,
+            )
+            logger.info("paddleocr_initialized")
+        except ImportError:
+            logger.error("paddleocr_not_installed")
+            raise RuntimeError(
+                "PaddleOCR is not installed. Run: pip install paddlepaddle paddleocr"
+            )
+    return _paddle_ocr
+
 
 def preprocess_image(img: np.ndarray) -> np.ndarray:
     """
-    Deterministic image preprocessing:
+    Deterministic image preprocessing pipeline:
     1. Grayscale
     2. Denoise
     3. Adaptive threshold (binarize)
@@ -31,14 +61,18 @@ def preprocess_image(img: np.ndarray) -> np.ndarray:
         gray = img.copy()
 
     # 2. Denoise
-    denoised = cv2.fastNlMeansDenoising(gray, None, h=10, templateWindowSize=7, searchWindowSize=21)
+    denoised = cv2.fastNlMeansDenoising(
+        gray, None, h=10, templateWindowSize=7, searchWindowSize=21
+    )
 
     # 3. Adaptive threshold
     thresh = cv2.adaptiveThreshold(
-        denoised, 255,
+        denoised,
+        255,
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
         cv2.THRESH_BINARY,
-        blockSize=31, C=5
+        blockSize=31,
+        C=5,
     )
 
     # 4. Deskew
@@ -63,77 +97,131 @@ def _deskew(img: np.ndarray) -> np.ndarray:
         (h, w) = img.shape[:2]
         center = (w // 2, h // 2)
         M = cv2.getRotationMatrix2D(center, angle, 1.0)
-        rotated = cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_CUBIC,
-                                  borderMode=cv2.BORDER_REPLICATE)
+        rotated = cv2.warpAffine(
+            img,
+            M,
+            (w, h),
+            flags=cv2.INTER_CUBIC,
+            borderMode=cv2.BORDER_REPLICATE,
+        )
         return rotated
     except Exception:
         return img
 
 
+def _paddle_result_to_tokens(
+    result: list,
+    page_no: int,
+) -> list[Token]:
+    """
+    Convert PaddleOCR result format to Token list.
+
+    PaddleOCR returns:
+    [
+      [
+        [[x1,y1],[x2,y2],[x3,y3],[x4,y4]],  # quad bbox
+        ("text", confidence)
+      ],
+      ...
+    ]
+    We convert the quad bbox to axis-aligned BBox (x0,y0,x1,y1).
+    Line IDs are assigned by Y-clustering (done later in layout_normalizer).
+    """
+    tokens = []
+    if not result or not result[0]:
+        return tokens
+
+    for item in result[0]:
+        if not item or len(item) < 2:
+            continue
+
+        quad = item[0]  # 4 corner points
+        text_conf = item[1]  # ("text", confidence)
+
+        if not quad or not text_conf:
+            continue
+
+        text = str(text_conf[0]).strip()
+        conf = float(text_conf[1]) if text_conf[1] is not None else 1.0
+
+        if not text:
+            continue
+
+        # Convert quad to axis-aligned bbox
+        xs = [p[0] for p in quad]
+        ys = [p[1] for p in quad]
+        bbox = BBox(
+            x0=min(xs),
+            y0=min(ys),
+            x1=max(xs),
+            y1=max(ys),
+            page=page_no,
+        )
+
+        # PaddleOCR returns whole text blocks — split into word tokens
+        words = text.split()
+        if not words:
+            continue
+
+        word_width = bbox.width / len(words)
+        for w_idx, word in enumerate(words):
+            word_bbox = BBox(
+                x0=bbox.x0 + w_idx * word_width,
+                y0=bbox.y0,
+                x1=bbox.x0 + (w_idx + 1) * word_width,
+                y1=bbox.y1,
+                page=page_no,
+            )
+            tokens.append(
+                Token(
+                    text=word,
+                    bbox=word_bbox,
+                    line_id=0,  # reassigned by layout_normalizer
+                    conf=conf,
+                )
+            )
+
+    return tokens
+
+
 def ocr_image(
     pil_image: Image.Image,
     page_no: int,
-    lang: str = "eng",
+    lang: str = "en",
 ) -> NormalizedPage:
     """
-    Run Tesseract OCR on a PIL image, return NormalizedPage with word bboxes.
-    Uses TSV output for word-level bboxes.
+    Run PaddleOCR on a PIL image.
+    Returns NormalizedPage with word-level tokens and bboxes.
     """
-    # Convert to OpenCV format
+    # Convert to numpy array for preprocessing
     img_array = np.array(pil_image.convert("RGB"))
     img_cv = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
 
-    # Preprocess
+    # Preprocess (deskew, denoise, binarize)
     processed = preprocess_image(img_cv)
 
-    # Convert back to PIL for pytesseract
-    processed_pil = Image.fromarray(processed)
+    # Convert back to RGB PIL for PaddleOCR
+    processed_rgb = cv2.cvtColor(processed, cv2.COLOR_GRAY2RGB)
 
-    # Run Tesseract with TSV output (word-level bboxes)
-    tsv_data = pytesseract.image_to_data(
-        processed_pil,
-        lang=lang,
-        output_type=pytesseract.Output.DICT,
-        config="--oem 3 --psm 6",  # LSTM OCR, assume uniform block
-    )
+    # Run PaddleOCR
+    ocr = _get_paddle_ocr()
+    result = ocr.ocr(processed_rgb, cls=True)
 
-    tokens = []
-    lines_text: dict[int, list[str]] = {}
-    n_boxes = len(tsv_data["text"])
+    # Convert to tokens
+    tokens = _paddle_result_to_tokens(result, page_no)
 
-    for i in range(n_boxes):
-        word = tsv_data["text"][i].strip()
-        if not word:
-            continue
-        conf = float(tsv_data["conf"][i])
-        if conf < 0:  # -1 means non-word
-            continue
-        x = tsv_data["left"][i]
-        y = tsv_data["top"][i]
-        w = tsv_data["width"][i]
-        h = tsv_data["height"][i]
-        line_num = tsv_data["line_num"][i]
-        par_num = tsv_data["par_num"][i]
-        block_num = tsv_data["block_num"][i]
-        line_id = block_num * 1000 + par_num * 100 + line_num
-
-        bbox = BBox(x0=x, y0=y, x1=x + w, y1=y + h, page=page_no)
-        tokens.append(Token(
-            text=word,
-            bbox=bbox,
-            line_id=line_id,
-            conf=conf / 100.0,  # normalize to 0-1
-        ))
-        lines_text.setdefault(line_id, []).append(word)
-
-    full_text = "\n".join(" ".join(map(str, words)) for _, words in sorted(lines_text.items()))
+    # Build full_text from tokens (rough ordering by Y then X)
+    sorted_tokens = sorted(tokens, key=lambda t: (t.bbox.y0, t.bbox.x0))
+    full_text = " ".join(t.text for t in sorted_tokens)
 
     logger.info("ocr_complete", page_no=page_no, token_count=len(tokens))
+
     return NormalizedPage(
         page_no=page_no,
         tokens=tokens,
         full_text=full_text,
         ocr_used=True,
+        pil_image=pil_image,  # store original (pre-preprocess) image for LayoutLM
     )
 
 

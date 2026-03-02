@@ -4,6 +4,7 @@ Celery worker tasks for document extraction (long-term stable).
 - Celery tasks remain synchronous.
 - DB updates use sync SQLAlchemy (psycopg/psycopg2) to avoid asyncpg issues.
 """
+
 from celery import Celery
 
 from app.settings import get_settings
@@ -44,6 +45,7 @@ def extract_task(
     document_type: str,
     supplier_id: str = None,
     filename: str = None,
+    requested_fields: list = None,
 ):
     import base64
 
@@ -66,6 +68,7 @@ def extract_task(
             document_type=document_type,
             supplier_id=supplier_id,
             filename=filename,
+            requested_fields=requested_fields or None,
         )
 
         update_job_status_sync(job_id, "completed")
@@ -75,8 +78,10 @@ def extract_task(
     except Exception as exc:
         log.error("task_failed", error=str(exc), exc_info=True)
 
-        # Mark failed only after retries exhausted; otherwise keep it retrying.
         if self.request.retries >= self.max_retries:
+            # Final attempt exhausted — mark permanently failed and do NOT retry
             update_job_status_sync(job_id, "failed", error=str(exc))
-
-        raise self.retry(exc=exc)
+            raise
+        else:
+            # Still have retries left — let Celery retry without touching job status
+            raise self.retry(exc=exc)

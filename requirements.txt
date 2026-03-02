@@ -13,6 +13,7 @@ alembic==1.13.1
 celery==5.4.0
 redis==5.0.4
 psycopg[binary]
+
 # MinIO
 minio==7.2.7
 
@@ -23,13 +24,19 @@ pdf2image==1.17.0
 numpy<2
 opencv-python-headless==4.9.0.80
 
-# OCR
-pytesseract==0.3.10
+# OCR — PaddleOCR replaces Tesseract
+paddlepaddle==2.6.2
+paddleocr==2.7.3
 Pillow==10.3.0
-opencv-python-headless==4.9.0.80
 
 # File detection
 python-magic==0.4.27
+
+# LayoutLM (Phase 1 Option A — pretrained fallback)
+torch==2.2.2
+torchvision==0.17.2
+transformers==4.40.1
+datasets==2.19.1
 
 # Misc utils
 PyYAML==6.0.1
