@@ -1,0 +1,223 @@
+# Grainger Summary Bill template
+# Document type: summary_bill (Grainger-specific consolidated billing)
+# Example: Summary Bill 7135182082, covering 01/01/2026 - 01/15/2026
+#
+# Structure:
+#   Page 1: Header fields (bill number, dates, totals, bill-to address)
+#   Pages 2-30: Per-PO line item detail (repeating blocks)
+#   Page 31: Totals summary (same as page 1)
+
+document_type: summary_bill
+party_id: grainger
+
+fields:
+
+  summary_bill_number:
+    type: string
+    required: true
+    anchors:
+      - "SUMMARY BILL INVOICE"
+      - "SUMMARY BILL NUMBER"
+      - "BILL NUMBER"
+    patterns:
+      - "\\b(\\d{10})\\b"
+    search_window: below_only
+    normalizers: []
+    validators: []
+    fallback_allowed: true
+
+  date_from:
+    type: date
+    required: true
+    anchors:
+      - "Date from"
+      - "DATE FROM"
+    patterns:
+      - "Date from\\s+(\\d{2}/\\d{2}/\\d{4})"
+      - "(\\d{2}/\\d{2}/\\d{4})\\s+\\d{2}/\\d{2}/\\d{4}"
+    search_window: same_line_or_next
+    normalizers:
+      - parse_date
+    validators: []
+    fallback_allowed: true
+
+  date_to:
+    type: date
+    required: true
+    anchors:
+      - "Date to"
+      - "DATE TO"
+    patterns:
+      - "Date to\\s+(\\d{2}/\\d{2}/\\d{4})"
+      - "\\d{2}/\\d{2}/\\d{4}\\s+(\\d{2}/\\d{2}/\\d{4})"
+    search_window: same_line_or_next
+    normalizers:
+      - parse_date
+    validators: []
+    fallback_allowed: true
+
+  due_date:
+    type: date
+    required: true
+    anchors:
+      - "FULL SUMMARY BILL DUE ON"
+      - "DUE ON"
+    patterns:
+      - "DUE ON\\s+(\\d{2}/\\d{2}/\\d{4})"
+    search_window: same_line_right
+    normalizers:
+      - parse_date
+    validators: []
+    fallback_allowed: true
+
+  net_invoice_amount:
+    type: currency
+    required: true
+    anchors:
+      - "NET INVOICE AMOUNT"
+    patterns:
+      - "NET INVOICE AMOUNT\\s+\\$\\s*([\\d,]+\\.\\d{2})"
+    search_window: same_line_right
+    normalizers:
+      - parse_currency
+    validators:
+      - positive_number
+    fallback_allowed: false
+
+  shipping_charges:
+    type: currency
+    required: false
+    anchors:
+      - "SHIPPING CHARGES"
+    patterns:
+      - "SHIPPING CHARGES\\s+\\$\\s*([\\d,]+\\.\\d{2})"
+    search_window: same_line_right
+    normalizers:
+      - parse_currency
+    validators:
+      - non_negative_number
+    fallback_allowed: true
+
+  tax:
+    type: currency
+    required: true
+    anchors:
+      - "TAX"
+    patterns:
+      - "TAX\\s+\\$\\s*([\\d,]+\\.\\d{2})"
+    search_window: same_line_right
+    normalizers:
+      - parse_currency
+    validators:
+      - non_negative_number
+    fallback_allowed: false
+
+  total_amount_due:
+    type: currency
+    required: true
+    anchors:
+      - "PLEASE PAY THIS AMOUNT"
+    patterns:
+      - "PLEASE PAY THIS AMOUNT[.\\s]+\\$\\s*([\\d,]+\\.\\d{2})"
+    search_window: same_line_right
+    normalizers:
+      - parse_currency
+    validators:
+      - positive_number
+    fallback_allowed: false
+
+  account_number:
+    type: string
+    required: true
+    anchors:
+      - "ACCOUNT NUMBER"
+      - "YOUR ACCOUNT NUMBER"
+    patterns:
+      - "ACCOUNT NUMBER\\s*\\((\\d{9})\\)"
+      - "\\b(804\\d{6})\\b"
+    search_window: same_line_right
+    normalizers: []
+    validators: []
+    fallback_allowed: true
+
+  bill_to_name:
+    type: string
+    required: false
+    anchors:
+      - "BILL TO"
+      - "BILL TO:"
+    patterns:
+      - "BILL TO:\\s*\\n([A-Z ]+)"
+    search_window: below_only
+    normalizers: []
+    validators: []
+    fallback_allowed: true
+
+  fei_number:
+    type: string
+    required: false
+    anchors:
+      - "F.E.I."
+      - "F.E.I. #"
+    patterns:
+      - "F\\.E\\.I\\.\\s*#([\\d-]+)"
+    search_window: same_line_right
+    normalizers: []
+    validators: []
+    fallback_allowed: true
+
+cross_field_validations:
+  - name: total_check
+    description: net_invoice_amount + shipping_charges + tax should equal total_amount_due
+    fields:
+      - net_invoice_amount
+      - shipping_charges
+      - tax
+      - total_amount_due
+    rule: "abs((net_invoice_amount + shipping_charges + tax) - total_amount_due) < 0.02"
+
+# ── Per-PO line item table (pages 2-30) ──────────────────────────────────────
+# Each PO block has a header row then one or more invoice rows, then line items.
+# The repeating table structure per PO:
+#
+#   ACCOUNT #   INVOICE #   INV DATE   ORDER #   NET AMOUNT   SHIPPING   TAX   TOTAL INVOICE
+#   804433613   9757329207  01/02/2026  1567054158   44.88       0.00     3.71    48.59
+#
+#   PO LINE#   QUANTITY   ITEM#   DESCRIPTION   CUST MATL#   UNIT PRICE   TOTAL PRICE
+#   7          12         6P757   Nipple,...                  3.74         44.88
+
+table:
+  header_keywords:
+    - "INVOICE #"
+    - "INV DATE"
+    - "NET AMOUNT"
+    - "TOTAL INVOICE"
+  stop_keywords:
+    - "TOTAL FOR PURCHASE ORDER"
+    - "TOTAL FOR DEPARTMENT"
+    - "NET INVOICE AMOUNT"
+  columns:
+    - field: account_number
+      keywords: ["ACCOUNT #", "ACCOUNT#"]
+      type: string
+    - field: invoice_number
+      keywords: ["INVOICE #", "INVOICE#"]
+      type: string
+    - field: inv_date
+      keywords: ["INV DATE", "INVOICE DATE"]
+      type: string
+    - field: order_number
+      keywords: ["ORDER #", "ORDER#"]
+      type: string
+    - field: net_amount
+      keywords: ["NET AMOUNT"]
+      type: number
+    - field: shipping
+      keywords: ["SHIPPING"]
+      type: number
+    - field: tax
+      keywords: ["TAX"]
+      type: number
+    - field: total_invoice
+      keywords: ["TOTAL INVOICE"]
+      type: number

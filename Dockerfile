@@ -2,8 +2,6 @@ FROM python:3.11-slim
 
 # System deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    tesseract-ocr \
-    tesseract-ocr-eng \
     libmagic1 \
     poppler-utils \
     libgl1 \

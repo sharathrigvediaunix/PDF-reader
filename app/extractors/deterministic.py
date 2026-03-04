@@ -1,24 +1,32 @@
 """
 Deterministic extraction engine.
-1. Anchor-based key-value extraction (fuzzy anchor matching)
-2. Regex extraction over full text
-3. Candidate scoring: method_weight + parse_success + validator_bonus - conflict_penalty
+1. Spatial anchor-based extraction (bbox search in all directions)
+2. Regex extraction over full text (fallback)
+3. Candidate scoring: method_weight + ocr_conf + parse_success + validator_bonus
 """
+
 import re
 from difflib import SequenceMatcher
 from typing import Any, Optional
 
 from app.config.loader import FieldConfig, DocumentConfig
 from app.models import (
-    NormalizedDocument, Token, BBox,
-    FieldResult, FieldCandidate, ExtractionMethod,
-    SourceLocation, Evidence, ExtractionStatus,
+    NormalizedDocument,
+    Token,
+    BBox,
+    FieldResult,
+    FieldCandidate,
+    ExtractionMethod,
+    SourceLocation,
+    Evidence,
+    ExtractionStatus,
 )
+from app.extractors.spatial import spatial_search
 from app.logging_config import get_logger
 
 logger = get_logger("deterministic_extractor")
 
-# Method base weights for scoring
+# Method base weights for confidence scoring
 METHOD_WEIGHTS = {
     ExtractionMethod.ANCHOR: 0.75,
     ExtractionMethod.REGEX: 0.55,
@@ -28,55 +36,18 @@ METHOD_WEIGHTS = {
 # Fuzzy match threshold for anchor detection
 ANCHOR_FUZZY_THRESHOLD = 0.80
 
+# Map search_window config values to spatial strategy names
+SEARCH_WINDOW_MAP = {
+    "same_line_right": "right_only",
+    "same_line_or_next": "right_then_below",
+    "next_3_lines": "below_then_right",
+    "full_text": "any",
+    "any": "any",
+}
+
 
 def _fuzzy_score(a: str, b: str) -> float:
     return SequenceMatcher(None, a.lower(), b.lower()).ratio()
-
-
-def _token_text_near(
-    tokens: list[Token],
-    anchor_idx: int,
-    search_window: str,
-    page_no: int,
-) -> list[tuple[str, Optional[BBox]]]:
-    """
-    Extract text near an anchor token based on search_window strategy.
-    Returns list of (text, bbox) tuples.
-    """
-    anchor_tok = tokens[anchor_idx]
-    anchor_line = anchor_tok.line_id
-    results = []
-
-    if search_window in ("same_line_or_next", "same_line_right"):
-        # same line after anchor
-        for tok in tokens[anchor_idx + 1:]:
-            if tok.line_id == anchor_line and tok.bbox.page == page_no:
-                results.append((tok.text, tok.bbox))
-            elif tok.line_id > anchor_line:
-                break
-
-        # If nothing on same line and window allows next line
-        if not results and search_window == "same_line_or_next":
-            next_line_id = None
-            for tok in tokens[anchor_idx + 1:]:
-                if tok.line_id != anchor_line:
-                    next_line_id = tok.line_id
-                    break
-            if next_line_id is not None:
-                for tok in tokens:
-                    if tok.line_id == next_line_id and tok.bbox.page == page_no:
-                        results.append((tok.text, tok.bbox))
-
-    elif search_window == "next_3_lines":
-        lines_found = set()
-        for tok in tokens[anchor_idx + 1:]:
-            if tok.bbox.page == page_no and tok.line_id > anchor_line:
-                lines_found.add(tok.line_id)
-                results.append((tok.text, tok.bbox))
-                if len(lines_found) >= 3:
-                    break
-
-    return results
 
 
 def _best_bbox(bboxes: list[BBox]) -> Optional[BBox]:
@@ -91,15 +62,27 @@ def _best_bbox(bboxes: list[BBox]) -> Optional[BBox]:
     )
 
 
+def _avg_conf(tokens: list[Token]) -> float:
+    """Average OCR confidence of a set of tokens."""
+    if not tokens:
+        return 1.0
+    return sum(t.conf for t in tokens) / len(tokens)
+
+
 def anchor_extract(
     doc: NormalizedDocument,
     field_config: FieldConfig,
 ) -> list[FieldCandidate]:
     """
-    Scan tokens for anchor phrases, extract value from surrounding tokens.
-    Supports fuzzy matching for anchor variants.
+    Spatially-aware anchor extraction.
+    For each page, scan tokens for anchor phrases using fuzzy matching.
+    Once anchor is found, use spatial search (right/below/nearby)
+    to find the value — regardless of layout.
     """
     candidates = []
+    spatial_strategy = SEARCH_WINDOW_MAP.get(
+        field_config.search_window, "right_then_below"
+    )
 
     for page in doc.pages:
         tokens = page.tokens
@@ -110,7 +93,6 @@ def anchor_extract(
 
             for anchor in field_config.anchors:
                 anchor_words = anchor.lower().split()
-                # Try multi-word anchor match
                 match_score = 0.0
                 matched_span = 1
 
@@ -118,7 +100,6 @@ def anchor_extract(
                     match_score = _fuzzy_score(tok_lower, anchor_words[0])
                     matched_span = 1
                 else:
-                    # Multi-word: check consecutive tokens
                     if i + len(anchor_words) <= n:
                         span_text = " ".join(
                             tokens[i + k].text.lower().strip(":#")
@@ -127,48 +108,63 @@ def anchor_extract(
                         match_score = _fuzzy_score(span_text, anchor)
                         matched_span = len(anchor_words)
 
-                if match_score >= ANCHOR_FUZZY_THRESHOLD:
-                    # Extract value tokens after anchor
-                    value_tokens = _token_text_near(
-                        tokens,
-                        i + matched_span - 1,
-                        field_config.search_window,
-                        page.page_no,
-                    )
+                if match_score < ANCHOR_FUZZY_THRESHOLD:
+                    continue
 
-                    if not value_tokens:
-                        continue
+                # ── Spatial search for value tokens ───────────────────────────
+                anchor_tok = tokens[i + matched_span - 1]
+                value_tokens = spatial_search(
+                    anchor=anchor_tok,
+                    tokens=tokens,
+                    page_no=page.page_no,
+                    strategy=spatial_strategy,
+                    window=field_config.window,
+                    patterns=field_config.compiled_patterns,
+                )
 
-                    # Strip colon from first token
-                    cleaned = []
-                    for txt, bbox in value_tokens:
-                        txt = txt.strip().lstrip(":").strip()
-                        if txt:
-                            cleaned.append((txt, bbox))
+                if not value_tokens:
+                    continue
 
-                    if not cleaned:
-                        continue
+                # Strip leading colons from first token
+                cleaned_tokens = []
+                for vt in value_tokens:
+                    text = vt.text.strip().lstrip(":").strip()
+                    if text:
+                        cleaned_tokens.append((text, vt.bbox, vt.conf))
 
-                    raw_value = " ".join(t for t, _ in cleaned)
-                    bboxes = [b for _, b in cleaned if b is not None]
-                    best_bb = _best_bbox(bboxes)
+                if not cleaned_tokens:
+                    continue
 
-                    # Context snippet
-                    ctx_start = max(0, i - 2)
-                    ctx_tokens = tokens[ctx_start: i + matched_span + len(cleaned)]
-                    snippet = " ".join(t.text for t in ctx_tokens)
+                raw_value = " ".join(t for t, _, _ in cleaned_tokens)
+                bboxes = [b for _, b, _ in cleaned_tokens]
+                best_bb = _best_bbox(bboxes)
 
-                    candidates.append(FieldCandidate(
+                # OCR confidence from value tokens
+                ocr_conf = _avg_conf(value_tokens)
+
+                # Context snippet
+                ctx_start = max(0, i - 2)
+                ctx_tokens = tokens[ctx_start : i + matched_span + len(cleaned_tokens)]
+                snippet = " ".join(t.text for t in ctx_tokens)
+
+                # Base confidence: method weight × anchor match × OCR confidence
+                base_conf = (
+                    METHOD_WEIGHTS[ExtractionMethod.ANCHOR] * match_score * ocr_conf
+                )
+
+                candidates.append(
+                    FieldCandidate(
                         value=raw_value,
                         raw_value=raw_value,
-                        confidence=METHOD_WEIGHTS[ExtractionMethod.ANCHOR] * match_score,
+                        confidence=base_conf,
                         method=ExtractionMethod.ANCHOR,
                         source=SourceLocation(
                             page=page.page_no,
                             bbox=best_bb.to_dict() if best_bb else None,
                         ),
                         evidence=Evidence(snippet=snippet),
-                    ))
+                    )
+                )
 
     logger.debug("anchor_candidates", field=field_config.name, count=len(candidates))
     return candidates
@@ -180,13 +176,13 @@ def regex_extract(
 ) -> list[FieldCandidate]:
     """
     Apply regex patterns over full text, map matches back to token bboxes.
+    Remains as a fallback when spatial anchor search fails.
     """
     candidates = []
     full_text = doc.full_text
 
     for pattern in field_config.compiled_patterns:
         for match in pattern.finditer(full_text):
-            # Try to get the capture group (group 1), else full match
             try:
                 raw_value = match.group(1).strip()
             except IndexError:
@@ -195,22 +191,22 @@ def regex_extract(
             if not raw_value:
                 continue
 
-            # Find approximate bbox by scanning tokens
             bbox, page_no = _find_token_bbox(doc, raw_value)
+            snippet = full_text[max(0, match.start() - 40) : match.end() + 40]
 
-            snippet = full_text[max(0, match.start() - 40): match.end() + 40]
-
-            candidates.append(FieldCandidate(
-                value=raw_value,
-                raw_value=raw_value,
-                confidence=METHOD_WEIGHTS[ExtractionMethod.REGEX],
-                method=ExtractionMethod.REGEX,
-                source=SourceLocation(
-                    page=page_no,
-                    bbox=bbox.to_dict() if bbox else None,
-                ),
-                evidence=Evidence(snippet=snippet.strip()),
-            ))
+            candidates.append(
+                FieldCandidate(
+                    value=raw_value,
+                    raw_value=raw_value,
+                    confidence=METHOD_WEIGHTS[ExtractionMethod.REGEX],
+                    method=ExtractionMethod.REGEX,
+                    source=SourceLocation(
+                        page=page_no,
+                        bbox=bbox.to_dict() if bbox else None,
+                    ),
+                    evidence=Evidence(snippet=snippet.strip()),
+                )
+            )
 
     logger.debug("regex_candidates", field=field_config.name, count=len(candidates))
     return candidates
@@ -225,19 +221,19 @@ def _find_token_bbox(doc: NormalizedDocument, text: str) -> tuple[Optional[BBox]
     for page in doc.pages:
         for i, tok in enumerate(page.tokens):
             if tok.text.lower().strip("$,.:") == words[0].strip("$,."):
-                # Check if subsequent tokens match
                 match_bboxes = [tok.bbox]
                 all_match = True
                 for j, w in enumerate(words[1:], 1):
                     if i + j < len(page.tokens):
-                        if page.tokens[i + j].text.lower().strip("$,.") == w.strip("$,."):
+                        if page.tokens[i + j].text.lower().strip("$,.") == w.strip(
+                            "$,."
+                        ):
                             match_bboxes.append(page.tokens[i + j].bbox)
                         else:
                             all_match = False
                             break
                 if all_match:
-                    bbox = _best_bbox(match_bboxes)
-                    return bbox, page.page_no
+                    return _best_bbox(match_bboxes), page.page_no
 
     return None, 0
 
@@ -249,16 +245,17 @@ def score_candidates(
     validator_fn,
 ) -> list[FieldCandidate]:
     """
-    Score and rank candidates:
-    - method_weight (base)
-    - +0.1 if normalization succeeds
-    - +0.15 if validation passes
-    - -0.2 for conflicts (duplicate values disagreeing)
+    Score and rank candidates.
+    score = base_confidence (anchor×match×ocr OR regex_weight)
+          + 0.10 if normalization succeeds
+          + 0.15 if all validators pass
+          - 0.05 per validation error
+          - 0.05 conflict penalty if top candidates disagree
     """
     scored = []
     for c in candidates:
         score = c.confidence
-        # Try normalization
+
         try:
             norm_val = normalizer_fn(c.raw_value, field_config)
             score += 0.10
@@ -266,7 +263,6 @@ def score_candidates(
         except Exception:
             norm_val = c.raw_value
 
-        # Try validation
         try:
             errors = validator_fn(norm_val, field_config)
             if not errors:
@@ -278,12 +274,11 @@ def score_candidates(
 
         scored.append(c.model_copy(update={"confidence": min(score, 1.0)}))
 
-    # Dedup: check for conflicting values among top candidates
+    # Conflict penalty
     if len(scored) > 1:
         top_val = scored[0].value if scored else None
         for c in scored[1:]:
             if c.value != top_val and c.confidence > 0.4:
-                # Conflict: slightly penalize all candidates
                 scored = [
                     x.model_copy(update={"confidence": x.confidence - 0.05})
                     for x in scored
@@ -302,14 +297,13 @@ def extract_field(
 ) -> FieldResult:
     """
     Run deterministic extraction for a single field.
-    Returns best FieldResult with alternatives in debug.
+    1. Spatial anchor search
+    2. Regex fallback
+    3. Score and pick best candidate
     """
     all_candidates: list[FieldCandidate] = []
 
-    # 1. Anchor-based
     all_candidates.extend(anchor_extract(doc, field_config))
-
-    # 2. Regex-based
     all_candidates.extend(regex_extract(doc, field_config))
 
     if not all_candidates:
@@ -318,11 +312,9 @@ def extract_field(
             status=ExtractionStatus.MISSING,
         )
 
-    # Score & rank
     scored = score_candidates(all_candidates, field_config, normalizer_fn, validator_fn)
     best = scored[0]
 
-    # Determine status based on confidence
     if best.confidence >= 0.85:
         status = ExtractionStatus.VERIFIED
     elif best.confidence >= 0.50:
@@ -339,5 +331,5 @@ def extract_field(
         method=best.method,
         source=best.source,
         evidence=best.evidence,
-        alternatives=scored[1:5],  # keep top 4 alternatives
+        alternatives=scored[1:5],
     )

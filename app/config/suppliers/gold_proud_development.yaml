@@ -1,0 +1,224 @@
+profile_id: gold_proud_gp_invoice_v1
+
+vendor:
+  name_contains:
+    - GOLD PROUD DEVELOPMENT LTD
+    - GPD
+    - HANG SENG BANK
+
+doc_types:
+  - commercial_invoice
+  - packing_list
+
+normalization:
+  prefer_pdf_text: true
+  ocr_fallback: paddleocr
+
+global_rules:
+  dedupe:
+    normalize_case: true
+    strip_spaces: true
+    strip_punctuation: false
+  ignore_zones:
+    header_top_pct: 0.18
+    footer_bottom_pct: 0.12
+
+fields_single:
+  invoice_number:
+    anchors:
+      - INV NO
+      - INV NO.
+      - INVOICE NO
+      - INVOICE #
+    direction:
+      - right
+      - below
+      - left
+      - above
+    window:
+      x: 450
+      y: 80
+    patterns:
+      - '(?i)\bGP-\d{1,4}\/\d{4}\b'
+    validators:
+      - min_len: 6
+    normalize:
+      - strip
+      - upper
+
+  invoice_date:
+    anchors:
+      - Date
+      - DATE
+    direction:
+      - right
+      - below
+      - left
+      - above
+    window:
+      x: 250
+      y: 80
+    patterns:
+      - '\b\d{4}\.\d{2}\.\d{2}\b'
+    normalize:
+      - date_yyyy.mm.dd
+
+  payment_terms:
+    anchors:
+      - Payment Term
+      - Payment Terms
+    direction:
+      - right
+      - below
+    window:
+      x: 350
+      y: 80
+    patterns:
+      - '(?i)\bT\/T\b.*\bDays\b'
+
+  incoterm:
+    anchors:
+      - Term of Sale
+      - Terms of Sale
+      - Incoterm
+    direction:
+      - right
+      - below
+    window:
+      x: 350
+      y: 120
+    patterns:
+      - '(?i)\bFOB\b.*'
+
+  country_of_origin:
+    anchors:
+      - Country of Origin
+    direction:
+      - right
+      - below
+    window:
+      x: 250
+      y: 80
+    patterns:
+      - '(?i)\bChina\b'
+
+  total_amount_usd:
+    anchors:
+      - TOTAL
+      - TOTAL:
+    direction:
+      - right
+      - below
+    window:
+      x: 500
+      y: 100
+    patterns:
+      - '(?i)\bTOTAL:\s*\d+\s+([0-9,]+\.\d{2})\b'
+    normalize:
+      - money
+
+fields_multi:
+  po_numbers:
+    anchors:
+      - PO NO
+      - PO NO.
+      - PO #
+      - Shipping Marks: PO NO
+    direction:
+      - right
+      - below
+      - left
+      - above
+    window:
+      x: 700
+      y: 140
+    mode: extract_all
+    split_on:
+      - "/"
+      - ","
+      - " "
+    patterns:
+      - '\b\d{6}\b'
+    dedupe: true
+
+  bl_number:
+    anchors:
+      - B/L NO
+      - B/L NO.
+      - BL NO
+    direction:
+      - right
+      - below
+      - left
+      - above
+    window:
+      x: 450
+      y: 140
+    mode: extract_all
+    patterns:
+      - '\b[A-Z0-9]{6,}\b'
+    dedupe: true
+
+tables:
+  line_items_invoice_view:
+    start_anchors:
+      - PO #
+      - Item #
+      - Item Description
+      - Unit Price
+      - Amount
+    end_anchors:
+      - TOTAL:
+      - Bank Info
+      - COMMERCIAL INVOICE
+    row_mode: by_line_y_cluster
+    columns:
+      po_number:
+        patterns:
+          - '^\d{6}$'
+      item_number:
+        patterns:
+          - '^[A-Z0-9]{6,}$'
+      description:
+        type: string
+      qty:
+        type: int
+      unit_price_usd:
+        type: money
+      amount_usd:
+        type: money
+
+  line_items_packing_list:
+    start_anchors:
+      - PO #
+      - Item Description
+      - QTY(PCS)
+      - G.W(KGS)
+      - N.W(KGS)
+      - CBM
+    end_anchors:
+      - Total:
+      - PACKING LIST
+    row_mode: by_line_y_cluster
+    columns:
+      po_number:
+        patterns:
+          - '^\d{6}$'
+      di_po:
+        patterns:
+          - '^\d{10}$'
+      item_number:
+        patterns:
+          - '^[A-Z0-9]{6,}$'
+      item_description:
+        type: string
+      qty_pcs:
+        type: int
+      cartons:
+        type: int
+      gross_weight_kgs:
+        type: money
+      net_weight_kgs:
+        type: money
+      cbm:
+        type: money

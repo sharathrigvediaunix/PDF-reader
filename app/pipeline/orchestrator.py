@@ -1,24 +1,30 @@
 """
 Main extraction pipeline orchestrator.
-Ties together: normalization -> deterministic extraction -> validation -> LLM fallback -> persistence.
-
-IMPORTANT:
-- This orchestrator is designed to be called from the Celery worker.
-- Therefore, ALL DB writes (artifacts + field_results) use SYNC SQLAlchemy (queries_sync.py)
-  to avoid asyncpg/concurrency issues inside Celery (prefork).
+Upgraded with:
+- Document type detection
+- Party/supplier identification
+- (doc_type × party) template resolution
+- LayoutLM fallback (Option A) after deterministic extraction
+- Drift detection — flags job when anchors fail or confidence drops
 """
+
 from __future__ import annotations
 
-import json
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Optional
 
-from app.config import load_config
+from app.config.loader import load_config, identify_party, identify_document_type
 from app.extractors.deterministic import extract_field
+from app.extractors.layoutlm import layoutlm_extract_field, should_use_layoutlm
 from app.fallback.gate import should_use_llm, llm_extract_field
 from app.fallback.llm_provider import get_llm_provider
-from app.models import ExtractionResult, FieldResult
+from app.models import (
+    ExtractionResult,
+    FieldResult,
+    JobStatus,
+    DriftReport,
+    ExtractionStatus,
+)
 from app.normalization import normalize_document
 from app.settings import get_settings
 from app.storage import upload_bytes, upload_json
@@ -28,62 +34,43 @@ from app.logging_config import get_logger
 
 logger = get_logger("pipeline")
 
+# If overall confidence drops below this, flag as DRIFT
+DRIFT_CONFIDENCE_THRESHOLD = 0.40
 
-class PipelineFileLogger:
-    """Appends all pipeline runs to a single pipeline_results.log, one JSON line per stage."""
-
-    def __init__(self, job_id: str, document_id: str, log_dir: str):
-        self.job_id = job_id
-        self.document_id = document_id
-        path = Path(log_dir)
-        path.mkdir(parents=True, exist_ok=True)
-        self._path = path / "pipeline_results.log"
-        self._file = self._path.open("a", encoding="utf-8")
-
-    def log_stage(self, stage: str, data: dict):
-        entry = {
-            "job_id": self.job_id,
-            "document_id": self.document_id,
-            "stage": stage,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            **data,
-        }
-        self._file.write(json.dumps(entry, default=str) + "\n")
-        self._file.flush()
-
-    def finalize(self):
-        self._file.close()
-        try:
-            log_bytes = self._path.read_bytes()
-            upload_bytes("logs/pipeline_results.log", log_bytes, content_type="application/x-ndjson")
-        except Exception:
-            pass
+# Minimum fields that must be found to avoid drift flag
+MIN_FIELDS_FOUND_RATIO = 0.50
 
 
 def run_extraction_pipeline(
     file_bytes: bytes,
     document_id: str,
     job_id: str,
-    document_type: str,
+    document_type: Optional[str] = None,
     supplier_id: Optional[str] = None,
     filename: Optional[str] = None,
+    requested_fields: Optional[list[str]] = None,  # user-selected fields to extract
 ) -> ExtractionResult:
     """
     Full end-to-end extraction pipeline.
+
     1) Upload original file to MinIO
-    2) Normalize document (PDF text or OCR)
-    3) Extract fields deterministically
-    4) Validate + score
-    5) LLM fallback for low-confidence/missing required fields
-    6) Persist results (SYNC DB writes)
-    7) Return ExtractionResult
+    2) Normalize document (PDF text or PaddleOCR) + layout normalization
+    3) Auto-detect document type (if not provided)
+    4) Auto-detect party/supplier (if not provided)
+    5) Load (doc_type × party) template config
+    6) Deterministic spatial extraction
+    7) LayoutLM fallback for low-confidence fields
+    8) LLM fallback (if enabled) for still-missing required fields
+    9) Validate + compute summary
+    10) Drift detection
+    11) Persist results
     """
     settings = get_settings()
-    log = logger.bind(job_id=job_id, document_id=document_id, document_type=document_type)
-    flog = PipelineFileLogger(job_id, document_id, settings.log_dir)
-
-    # Stored only if settings.debug is True
-    debug_trace: dict[str, dict] = {}
+    log = logger.bind(job_id=job_id, document_id=document_id)
+    debug_trace: dict = {
+        "stages": {},  # keyed by stage name, each has its own data
+        "fields": {},  # keyed by field name
+    }
 
     try:
         # ── 1. Upload original file ────────────────────────────────────────────
@@ -97,24 +84,35 @@ def run_extraction_pipeline(
         log.info("normalization_start")
         norm_doc = normalize_document(file_bytes, document_id, filename)
         log.info("normalization_done", pages=len(norm_doc.pages))
-        flog.log_stage("normalization", {
-            "pages": len(norm_doc.pages),
-            "total_tokens": sum(len(p.tokens) for p in norm_doc.pages),
-            "tokens_by_page": [
+
+        # Capture normalization output in trace
+        norm_pages_trace = []
+        for page in norm_doc.pages:
+            norm_pages_trace.append(
                 {
-                    "page": p.page_no,
-                    "ocr_used": p.ocr_used,
-                    "token_count": len(p.tokens),
-                    "tokens": [
-                        {"text": t.text, "bbox": t.bbox.to_dict(), "line_id": t.line_id, "conf": t.conf}
-                        for t in p.tokens
+                    "page_no": page.page_no,
+                    "ocr_used": page.ocr_used,
+                    "token_count": len(page.tokens),
+                    "layout_lines": len(page.layout_lines),
+                    "layout_columns": len(page.layout_columns),
+                    "full_text": page.full_text[:2000],  # first 2000 chars
+                    "tokens_sample": [
+                        {
+                            "text": t.text,
+                            "bbox": t.bbox.to_dict(),
+                            "conf": round(t.conf, 3),
+                        }
+                        for t in page.tokens[:100]  # first 100 tokens
                     ],
                 }
-                for p in norm_doc.pages
-            ],
-        })
+            )
+        debug_trace["stages"]["1_normalization"] = {
+            "pages": len(norm_doc.pages),
+            "ocr_used": any(p.ocr_used for p in norm_doc.pages),
+            "page_detail": norm_pages_trace,
+        }
 
-        # Upload OCR outputs (only when OCR used)
+        # Upload OCR outputs for scanned pages
         for page in norm_doc.pages:
             if page.ocr_used:
                 ocr_data = {
@@ -124,21 +122,98 @@ def run_extraction_pipeline(
                         for t in page.tokens
                     ],
                     "full_text": page.full_text,
+                    "layout_lines": len(page.layout_lines),
+                    "layout_columns": len(page.layout_columns),
                 }
                 ocr_key = f"{document_id}/ocr/page_{page.page_no}.json"
                 ocr_url = upload_json(ocr_key, ocr_data)
-                save_artifact_sync(document_id, "ocr_json", ocr_url, {"page": page.page_no})
+                save_artifact_sync(
+                    document_id, "ocr_json", ocr_url, {"page": page.page_no}
+                )
 
-        # ── 3. Load field config ───────────────────────────────────────────────
-        doc_config = load_config(document_type)
-        flog.log_stage("config", {"document_type": document_type, "field_names": list(doc_config.fields.keys())})
+        # ── 3. Auto-detect document type ───────────────────────────────────────
+        first_page_text = norm_doc.pages[0].full_text if norm_doc.pages else ""
 
-        # ── 4. Deterministic extraction ────────────────────────────────────────
-        log.info("extraction_start", fields=list(doc_config.fields.keys()))
+        if not document_type:
+            document_type, type_conf = identify_document_type(first_page_text)
+            log.info(
+                "document_type_detected", doc_type=document_type, confidence=type_conf
+            )
+        else:
+            type_conf = 1.0
+
+        norm_doc.doc_type = document_type
+
+        # ── 4. Auto-detect party/supplier ─────────────────────────────────────
+        if not supplier_id:
+            party_id, party_conf = identify_party(first_page_text)
+            if party_id:
+                supplier_id = party_id
+                log.info("party_detected", party_id=party_id, confidence=party_conf)
+            else:
+                log.info("party_not_detected_using_default")
+                party_conf = 0.0
+        else:
+            party_conf = 1.0
+
+        norm_doc.party_id = supplier_id
+
+        debug_trace["stages"]["2_detection"] = {
+            "document_type": document_type,
+            "type_confidence": round(type_conf, 3),
+            "supplier_id": supplier_id,
+            "party_confidence": round(party_conf, 3),
+            "first_page_text": first_page_text[:2000],
+        }
+
+        # ── 5. Load (doc_type × party) template ───────────────────────────────
+        doc_config = load_config(document_type, supplier_id)
+        log.info("template_loaded", doc_type=document_type, party=supplier_id)
+
+        fields_to_extract = doc_config.fields_for_request(requested_fields)
+
+        debug_trace["stages"]["3_template"] = {
+            "profile_id": doc_config.profile_id,
+            "all_blueprint_fields": doc_config.available_fields(),
+            "requested_fields": requested_fields,
+            "fields_to_extract": list(fields_to_extract.keys()),
+            "field_configs": {
+                fname: {
+                    "anchors": fc.anchors,
+                    "patterns": fc.patterns,
+                    "direction": fc.direction,
+                    "window": fc.window,
+                    "search_window": fc.search_window,
+                    "multi": fc.multi,
+                }
+                for fname, fc in fields_to_extract.items()
+            },
+        }
+
+        # ── 6. Deterministic spatial extraction ───────────────────────────────
+        log.info("extraction_start", fields=list(fields_to_extract.keys()))
         extracted_fields: dict[str, FieldResult] = {}
 
-        for fname, fconfig in doc_config.fields.items():
+        from app.extractors.deterministic import (
+            anchor_extract,
+            regex_extract,
+            score_candidates,
+        )
+
+        for fname, fconfig in fields_to_extract.items():
             log.debug("extracting_field", field=fname)
+
+            # Run anchor and regex separately so we can trace each
+            anchor_candidates = anchor_extract(norm_doc, fconfig)
+            regex_candidates = regex_extract(norm_doc, fconfig)
+            all_candidates = anchor_candidates + regex_candidates
+            scored = (
+                score_candidates(
+                    all_candidates, fconfig, normalize_value, validate_value
+                )
+                if all_candidates
+                else []
+            )
 
             fr = extract_field(
                 norm_doc,
@@ -146,74 +221,135 @@ def run_extraction_pipeline(
                 normalizer_fn=normalize_value,
                 validator_fn=validate_value,
             )
-
             if fr.value is not None:
                 errors = validate_value(fr.value, fconfig)
                 fr.validation_errors = errors
-                if errors:
-                    log.debug("field_validation_errors", field=fname, errors=errors)
-
             extracted_fields[fname] = fr
-            flog.log_stage("extraction", {
-                "field": fname,
-                "value": fr.value,
-                "confidence": fr.confidence,
-                "status": fr.status.value,
-                "method": fr.method.value if fr.method else None,
-                "validation_errors": fr.validation_errors,
-                "candidates": [
-                    {"value": c.value, "confidence": c.confidence, "method": c.method.value}
-                    for c in (fr.alternatives or [])[:3]
-                ],
-            })
 
-            debug_trace[fname] = {
-                "method": fr.method.value if fr.method else None,
-                "confidence": fr.confidence,
-                "status": fr.status.value,
-                "candidates": [
+            debug_trace["fields"][fname] = {
+                "anchor_candidates": [
                     {
                         "value": c.value,
-                        "confidence": c.confidence,
+                        "raw_value": c.raw_value,
+                        "confidence": round(c.confidence, 4),
+                        "method": c.method.value,
+                        "snippet": c.evidence.snippet if c.evidence else "",
+                        "page": c.source.page if c.source else None,
+                        "bbox": c.source.bbox if c.source else None,
+                    }
+                    for c in anchor_candidates
+                ],
+                "regex_candidates": [
+                    {
+                        "value": c.value,
+                        "raw_value": c.raw_value,
+                        "confidence": round(c.confidence, 4),
+                        "snippet": c.evidence.snippet if c.evidence else "",
+                        "page": c.source.page if c.source else None,
+                    }
+                    for c in regex_candidates
+                ],
+                "scored_candidates": [
+                    {
+                        "value": c.value,
+                        "confidence": round(c.confidence, 4),
                         "method": c.method.value,
                     }
-                    for c in (fr.alternatives or [])[:3]
+                    for c in scored[:5]
                 ],
+                "final": {
+                    "value": fr.value,
+                    "confidence": round(fr.confidence, 4),
+                    "status": fr.status.value,
+                    "method": fr.method.value if fr.method else None,
+                    "snippet": fr.evidence.snippet if fr.evidence else "",
+                    "validation_errors": fr.validation_errors,
+                },
             }
 
-        # ── 5. LLM fallback ────────────────────────────────────────────────────
+        # ── 7. LayoutLM fallback ───────────────────────────────────────────────
+        layoutlm_used = False
+        layoutlm_trace = {}
+        for fname, fconfig in fields_to_extract.items():
+            fr = extracted_fields[fname]
+            if should_use_layoutlm(fr, fconfig):
+                log.info("layoutlm_fallback", field=fname, current_conf=fr.confidence)
+                fr2 = layoutlm_extract_field(norm_doc, fconfig, fr)
+                upgraded = fr2.confidence > fr.confidence
+                layoutlm_trace[fname] = {
+                    "triggered": True,
+                    "before_conf": round(fr.confidence, 4),
+                    "after_conf": round(fr2.confidence, 4),
+                    "upgraded": upgraded,
+                    "new_value": fr2.value if upgraded else None,
+                }
+                if upgraded:
+                    extracted_fields[fname] = fr2
+                    debug_trace["fields"][fname]["layoutlm"] = layoutlm_trace[fname]
+                    layoutlm_used = True
+            else:
+                layoutlm_trace[fname] = {
+                    "triggered": False,
+                    "reason": "confidence ok or fallback_allowed=False",
+                }
+
+        debug_trace["stages"]["4_layoutlm"] = {
+            "used": layoutlm_used,
+            "fields": layoutlm_trace,
+        }
+
+        # ── 8. LLM fallback (if enabled) ──────────────────────────────────────
+        llm_trace = {}
         if settings.llm_fallback_enabled:
             llm_provider = get_llm_provider()
-            for fname, fconfig in doc_config.fields.items():
+            for fname, fconfig in fields_to_extract.items():
                 fr = extracted_fields[fname]
                 if should_use_llm(fr, fconfig):
                     log.info("llm_fallback", field=fname)
-                    fr2 = llm_extract_field(fr, fconfig, norm_doc, provider=llm_provider)
+                    fr2 = llm_extract_field(
+                        fr, fconfig, norm_doc, provider=llm_provider
+                    )
                     extracted_fields[fname] = fr2
-                    if fname in debug_trace:
-                        debug_trace[fname]["llm_used"] = True
-                    flog.log_stage("llm_fallback", {
-                        "field": fname,
+                    llm_trace[fname] = {
+                        "triggered": True,
                         "value": fr2.value,
-                        "confidence": fr2.confidence,
-                        "status": fr2.status.value,
-                    })
+                        "confidence": round(fr2.confidence, 4),
+                    }
+                    debug_trace["fields"][fname]["llm"] = llm_trace[fname]
+                else:
+                    llm_trace[fname] = {"triggered": False}
+        debug_trace["stages"]["5_llm"] = {
+            "enabled": settings.llm_fallback_enabled,
+            "fields": llm_trace,
+        }
 
-        # ── 6. Compute validation summary ──────────────────────────────────────
+        # ── 9. Validation summary ──────────────────────────────────────────────
         summary = compute_validation_summary(extracted_fields, doc_config)
         log.info(
             "validation_done",
             required_present=summary.required_present,
             overall_confidence=summary.overall_confidence,
         )
-        flog.log_stage("validation", {
+
+        debug_trace["stages"]["6_validation"] = {
             "required_present": summary.required_present,
             "required_missing": summary.required_missing,
-            "overall_confidence": summary.overall_confidence,
+            "overall_confidence": round(summary.overall_confidence, 4),
             "cross_field_errors": summary.cross_field_errors,
-        })
+        }
 
-        # ── 7. Build result ────────────────────────────────────────────────────
+        # ── 10. Drift detection ────────────────────────────────────────────────
+        drift_report = _detect_drift(
+            extracted_fields, doc_config, document_type, supplier_id, summary
+        )
+        if drift_report:
+            log.warning(
+                "drift_detected",
+                missing=drift_report.missing_anchors,
+                low_conf=drift_report.low_confidence_fields,
+            )
+
+        # ── 11. Build and persist result ───────────────────────────────────────
         result = ExtractionResult(
             document_id=document_id,
             job_id=job_id,
@@ -221,30 +357,16 @@ def run_extraction_pipeline(
             document_type=document_type,
             fields=extracted_fields,
             validation_summary=summary,
+            drift_report=drift_report,
         )
-        flog.log_stage("result_build", {
-            "field_count": len(extracted_fields),
-            "fields": {
-                name: {"value": fr.value, "status": fr.status.value, "confidence": fr.confidence}
-                for name, fr in extracted_fields.items()
-            },
-        })
 
-        # Upload debug trace (optional)
-        if settings.debug:
-            debug_key = f"{document_id}/debug/debug_trace_{job_id}.json"
-            debug_url = upload_json(debug_key, debug_trace)
-            save_artifact_sync(document_id, "debug_trace", debug_url, {"job_id": job_id})
-            result.debug_trace = debug_trace
+        # Always save debug trace — Streamlit pipeline inspector depends on it
+        debug_key = f"{document_id}/debug/debug_trace_{job_id}.json"
+        debug_url = upload_json(debug_key, debug_trace)
+        save_artifact_sync(document_id, "debug_trace", debug_url, {"job_id": job_id})
+        result.debug_trace = debug_trace
 
-        # ── 8. Persist field results (SYNC, Celery-safe) ───────────────────────
-        try:
-            save_field_results_sync(job_id, result)
-            flog.log_stage("persistence", {"success": True})
-        except Exception as persist_err:
-            flog.log_stage("persistence", {"success": False, "error": str(persist_err)})
-            raise
-
+        save_field_results_sync(job_id, result)
         log.info("pipeline_complete", fields_extracted=len(extracted_fields))
         flog.finalize()
         return result
@@ -253,3 +375,57 @@ def run_extraction_pipeline(
         log.error("pipeline_error", error=str(e), exc_info=True)
         flog.finalize()
         raise
+
+
+def _detect_drift(
+    extracted_fields: dict[str, FieldResult],
+    doc_config,
+    document_type: str,
+    supplier_id: Optional[str],
+    summary,
+) -> Optional[DriftReport]:
+    """
+    Check if extraction results suggest template drift.
+    Drift is flagged when:
+    - Too many required fields are missing
+    - Overall confidence drops below threshold
+    - A significant portion of fields failed extraction
+    """
+    missing_anchors = [
+        fname
+        for fname, fr in extracted_fields.items()
+        if fr.status == ExtractionStatus.MISSING and doc_config.fields[fname].required
+    ]
+
+    low_conf_fields = [
+        fname
+        for fname, fr in extracted_fields.items()
+        if fr.confidence < DRIFT_CONFIDENCE_THRESHOLD
+        and fr.status != ExtractionStatus.MISSING
+    ]
+
+    total_fields = len(extracted_fields)
+    found_fields = sum(
+        1 for fr in extracted_fields.values() if fr.status != ExtractionStatus.MISSING
+    )
+    found_ratio = found_fields / total_fields if total_fields > 0 else 0.0
+
+    is_drift = (
+        len(missing_anchors) > 0
+        or summary.overall_confidence < DRIFT_CONFIDENCE_THRESHOLD
+        or found_ratio < MIN_FIELDS_FOUND_RATIO
+    )
+
+    if not is_drift:
+        return None
+
+    return DriftReport(
+        supplier_id=supplier_id,
+        document_type=document_type,
+        missing_anchors=missing_anchors,
+        low_confidence_fields=low_conf_fields,
+        confidence_scores={
+            fname: fr.confidence for fname, fr in extracted_fields.items()
+        },
+        flagged_at=datetime.now(timezone.utc).isoformat(),
+    )

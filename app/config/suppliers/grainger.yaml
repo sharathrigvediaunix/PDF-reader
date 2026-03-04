@@ -1,0 +1,184 @@
+profile_id: grainger_summary_bill_v1
+vendor:
+  name_contains: ["Grainger", "S_SUMMBILL@grainger.com", "SUMMARY BILL INVOICE"]
+doc_types: ["summary_bill"]
+
+normalization:
+  prefer_pdf_text: true
+  ocr_fallback: paddleocr
+
+global_rules:
+  dedupe:
+    normalize_case: true
+    strip_spaces: true
+  pagination:
+    treat_each_invoice_block_as_record: true
+
+fields_single:
+  summary_bill_number:
+    anchors: ["SUMMARY BILL INVOICE", "SUMMARY BILL NUMBER", "BILL NUMBER"]
+    direction: ["right", "below", "left"]
+    window: { x: 600, y: 60 }
+    patterns:
+      - '\b\d{10}\b'
+    normalize: "strip"
+
+  summary_date_from:
+    anchors: ["Date from"]
+    direction: ["below", "right"]
+    window: { x: 300, y: 60 }
+    patterns:
+      - '\b\d{2}\/\d{2}\/\d{4}\b'
+    normalize: "date_mm/dd/yyyy"
+
+  summary_date_to:
+    anchors: ["Date to"]
+    direction: ["below", "right"]
+    window: { x: 300, y: 60 }
+    patterns:
+      - '\b\d{2}\/\d{2}\/\d{4}\b'
+    normalize: "date_mm/dd/yyyy"
+
+  summary_total_pay_amount:
+    anchors: ["PLEASE PAY THIS AMOUNT"]
+    direction: ["right", "below"]
+    window: { x: 700, y: 60 }
+    patterns:
+      - '[0-9,]+\.\d{2}'
+    normalize: "money"
+
+  net_invoice_amount:
+    anchors: ["NET INVOICE AMOUNT"]
+    direction: ["right", "below"]
+    window: { x: 700, y: 40 }
+    patterns:
+      - '[0-9,]+\.\d{2}'
+    normalize: "money"
+
+  shipping_charges:
+    anchors: ["SHIPPING CHARGES"]
+    direction: ["right", "below"]
+    window: { x: 700, y: 40 }
+    patterns:
+      - '[0-9,]+\.\d{2}'
+    normalize: "money"
+
+  tax_amount:
+    anchors: ["TAX"]
+    direction: ["right", "below"]
+    window: { x: 700, y: 40 }
+    patterns:
+      - '[0-9,]+\.\d{2}'
+    normalize: "money"
+
+records:
+  invoice_blocks:
+    start_anchors:
+      - "PURCHASE ORDER #:"
+      - "PURCHASE ORDER #"
+      - "ACCOUNT #"
+      - "INVOICE #"
+      - "INV DATE"
+      - "ORDER #"
+    end_anchors:
+      - "TOTAL FOR PURCHASE ORDER #"
+      - "SUMMARY BILL NUMBER"
+
+    record_id:
+      anchors: ["PURCHASE ORDER #", "INVOICE #"]
+      patterns:
+        - '\b\d{6}\b'
+        - '\b\d{10}\b'
+
+    fields_single:
+      po_number:
+        anchors: ["PURCHASE ORDER #:", "PURCHASE ORDER #", "PO#:"]
+        direction: ["right", "below"]
+        window: { x: 400, y: 60 }
+        patterns: ['\b\d{6}\b']
+
+      account_number:
+        anchors: ["ACCOUNT #"]
+        direction: ["right", "below"]
+        window: { x: 300, y: 60 }
+        patterns: ['\b\d{9}\b']
+
+      invoice_number:
+        anchors: ["INVOICE #"]
+        direction: ["right", "below"]
+        window: { x: 300, y: 60 }
+        patterns: ['\b\d{10}\b']
+
+      invoice_date:
+        anchors: ["INV DATE"]
+        direction: ["right", "below"]
+        window: { x: 300, y: 60 }
+        patterns: ['\b\d{2}\/\d{2}\/\d{4}\b']
+        normalize: "date_mm/dd/yyyy"
+
+      order_number:
+        anchors: ["ORDER #"]
+        direction: ["right", "below"]
+        window: { x: 300, y: 60 }
+        patterns: ['\b\d{10}\b']
+
+      net_amount:
+        anchors: ["NET AMOUNT"]
+        direction: ["right", "below"]
+        window: { x: 500, y: 40 }
+        patterns: ['\b[0-9,]+\.\d{2}\b']
+        normalize: "money"
+
+      shipping_amount:
+        anchors: ["SHIPPING"]
+        direction: ["right", "below"]
+        window: { x: 500, y: 40 }
+        patterns: ['\b[0-9,]+\.\d{2}\b']
+        normalize: "money"
+
+      tax_amount:
+        anchors: ["TAX"]
+        direction: ["right", "below"]
+        window: { x: 500, y: 40 }
+        patterns: ['\b[0-9,]+\.\d{2}\b']
+        normalize: "money"
+
+      total_invoice_amount:
+        anchors: ["TOTAL INVOICE"]
+        direction: ["right", "below"]
+        window: { x: 500, y: 40 }
+        patterns: ['\b[0-9,]+\.\d{2}\b']
+        normalize: "money"
+
+    fields_multi:
+      tracking_numbers:
+        anchors: ["TRACKING #", "TRACKING #:"]
+        direction: ["right", "below"]
+        window: { x: 800, y: 120 }
+        mode: "extract_all"
+        split_on: [",", " "]
+        patterns:
+          - '\b\d{9,15}\b'
+        dedupe: true
+
+      delivery_numbers:
+        anchors: ["Delivery #", "Delivery #:"]
+        direction: ["right", "below"]
+        window: { x: 400, y: 120 }
+        mode: "extract_all"
+        patterns:
+          - '\b\d{10}\b'
+        dedupe: true
+
+    tables:
+      line_items:
+        start_anchors: ["PO LINE#", "QUANTITY", "ITEM#", "DESCRIPTION", "UNIT PRICE", "TOTAL PRICE"]
+        end_anchors: ["TOTAL FOR PURCHASE ORDER #", "SHIP TO:", "PO#:"]
+        row_mode: "by_line_y_cluster"
+        columns:
+          po_line:      { type: "int" }
+          quantity:     { type: "int" }
+          item_number:  { type: "string" }
+          description:  { type: "string" }
+          unit_price:   { type: "money" }
+          total_price:  { type: "money" }
