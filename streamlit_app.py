@@ -134,22 +134,36 @@ poll_timeout = st.sidebar.slider("Timeout (s)", 10, 600, int(POLL_TIMEOUT), 10)
 # ── System status panel ───────────────────────────────────────────────────────
 st.sidebar.divider()
 with st.sidebar.expander("🖥 System status", expanded=False):
-    if st.button("Refresh status", key="refresh_status"):
-        st.session_state["system_status"] = None  # force re-fetch
-
     if "system_status" not in st.session_state:
         st.session_state["system_status"] = None
 
-    try:
-        r = requests.get(f"{API_BASE_URL}/v1/status", timeout=6)
-        r.raise_for_status()
-        st.session_state["system_status"] = r.json()
-    except Exception:
-        pass
+    if st.button("Refresh status", key="refresh_status"):
+        try:
+            r = requests.get(f"{API_BASE_URL}/v1/status", timeout=4)
+            r.raise_for_status()
+            st.session_state["system_status"] = r.json()
+        except Exception as e:
+            st.session_state["system_status"] = {"_error": str(e)}
 
-    status_data = st.session_state.get("system_status")
-    if not status_data:
-        st.warning("Could not reach API")
+    # Auto-fetch only once on first load (when state is None)
+    if st.session_state["system_status"] is None:
+        try:
+            r = requests.get(f"{API_BASE_URL}/v1/status", timeout=4)
+            r.raise_for_status()
+            st.session_state["system_status"] = r.json()
+        except Exception as e:
+            st.session_state["system_status"] = {"_error": str(e)}
+
+    status_data = st.session_state.get("system_status") or {}
+
+    if "_error" in status_data:
+        st.warning(f"⚠️ API unreachable\n\n`{status_data['_error']}`")
+        st.caption(f"Expects API at: `{API_BASE_URL}`")
+        st.caption(
+            "If running via Docker, set `API_BASE_URL=http://api:8000` in the Streamlit service env."
+        )
+    elif not status_data:
+        st.info("Click **Refresh status** to check services.")
     else:
         overall = status_data.get("overall", "unknown")
         st.markdown(f"**Overall: {'🟢 OK' if overall == 'ok' else '🔴 Degraded'}**")
@@ -161,7 +175,6 @@ with st.sidebar.expander("🖥 System status", expanded=False):
                 else ("🟡" if svc_status == "no_workers" else "🔴")
             )
 
-        # Redis
         redis_s = status_data.get("redis", {})
         st.markdown(
             f"{_badge(redis_s.get('status', '?'))} **Redis** — {redis_s.get('status', '?')}"
@@ -169,7 +182,6 @@ with st.sidebar.expander("🖥 System status", expanded=False):
         if redis_s.get("detail"):
             st.caption(redis_s["detail"])
 
-        # Celery
         cel = status_data.get("celery", {})
         cel_status = cel.get("status", "?")
         workers = cel.get("workers", [])
@@ -178,13 +190,11 @@ with st.sidebar.expander("🖥 System status", expanded=False):
         )
         for w in workers:
             st.caption(
-                f"  • {w['name']}  |  active tasks: {w['active_tasks']}"
-                f"  |  concurrency: {w['concurrency']}"
+                f"  • {w['name']}  |  active: {w['active_tasks']}  |  concurrency: {w['concurrency']}"
             )
         if cel.get("detail"):
             st.caption(cel["detail"])
 
-        # Postgres
         pg = status_data.get("postgres", {})
         st.markdown(
             f"{_badge(pg.get('status', '?'))} **PostgreSQL** — {pg.get('status', '?')}"
@@ -192,7 +202,6 @@ with st.sidebar.expander("🖥 System status", expanded=False):
         if pg.get("detail"):
             st.caption(pg["detail"])
 
-        # MinIO
         minio = status_data.get("minio", {})
         st.markdown(
             f"{_badge(minio.get('status', '?'))} **MinIO** — {minio.get('status', '?')}"
@@ -464,3 +473,189 @@ if last:
 
         if show_raw:
             st.json(result)
+
+        # ── Pipeline inspector ────────────────────────────────────────────────
+        st.divider()
+        with st.expander("🔬 Pipeline inspector — step-by-step trace", expanded=False):
+            try:
+                tr = requests.get(f"{API_BASE_URL}/v1/jobs/{job_id}/trace", timeout=15)
+                tr.raise_for_status()
+                trace = tr.json()
+            except Exception as e:
+                st.error(f"Could not load trace: {e}")
+                trace = None
+
+            if trace:
+                stages = trace.get("stages", {})
+                fields_trace = trace.get("fields", {})
+
+                # ── Stage 1: Normalization ────────────────────────────────────
+                with st.expander("① Normalization", expanded=False):
+                    s1 = stages.get("1_normalization", {})
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("Pages", s1.get("pages", "?"))
+                    c2.metric("OCR used", "Yes" if s1.get("ocr_used") else "No")
+                    c3.metric(
+                        "Method", "PaddleOCR" if s1.get("ocr_used") else "pdfminer"
+                    )
+
+                    for pg in s1.get("page_detail", []):
+                        with st.expander(
+                            f"Page {pg['page_no']}  —  {pg['token_count']} tokens  |  {pg['layout_lines']} lines"
+                        ):
+                            st.markdown("**Full text extracted:**")
+                            st.code(pg.get("full_text", ""), language=None)
+                            st.markdown(
+                                f"Layout columns detected: `{pg.get('layout_columns', 0)}`"
+                            )
+                            st.markdown(
+                                "**First 100 tokens (text · bbox · ocr_conf):**"
+                            )
+                            tok_df = pd.DataFrame(pg.get("tokens_sample", []))
+                            if not tok_df.empty:
+                                st.dataframe(
+                                    tok_df, use_container_width=True, hide_index=True
+                                )
+
+                # ── Stage 2: Detection ────────────────────────────────────────
+                with st.expander("② Supplier & doc-type detection", expanded=False):
+                    s2 = stages.get("2_detection", {})
+                    c1, c2 = st.columns(2)
+                    c1.metric(
+                        "Supplier detected",
+                        s2.get("supplier_id", "None"),
+                        delta=f"conf {s2.get('party_confidence', 0):.0%}",
+                    )
+                    c2.metric(
+                        "Doc type detected",
+                        s2.get("document_type", "?"),
+                        delta=f"conf {s2.get('type_confidence', 0):.0%}",
+                    )
+                    st.markdown("**First-page text used for detection:**")
+                    st.code(s2.get("first_page_text", ""), language=None)
+
+                # ── Stage 3: Template ─────────────────────────────────────────
+                with st.expander("③ Template loaded", expanded=False):
+                    s3 = stages.get("3_template", {})
+                    st.write(f"**Profile:** `{s3.get('profile_id', 'unknown')}`")
+                    st.write(
+                        f"**All blueprint fields:** `{'`, `'.join(s3.get('all_blueprint_fields', []))}`"
+                    )
+                    st.write(
+                        f"**Requested by user:** `{'`, `'.join(s3.get('requested_fields') or ['(all)'])}`"
+                    )
+                    st.write(
+                        f"**Actually extracted:** `{'`, `'.join(s3.get('fields_to_extract', []))}`"
+                    )
+                    st.markdown(
+                        "**Field configs (anchors · patterns · search window):**"
+                    )
+                    for fname, fc in (s3.get("field_configs") or {}).items():
+                        st.markdown(
+                            f"- **{fname}**: anchors=`{fc.get('anchors')}` · window=`{fc.get('search_window')}` · direction=`{fc.get('direction')}`"
+                        )
+
+                # ── Stage 4: Per-field extraction ─────────────────────────────
+                with st.expander("④ Per-field extraction detail", expanded=True):
+                    if not fields_trace:
+                        st.info("No per-field trace available.")
+                    for fname, ft in fields_trace.items():
+                        final = ft.get("final", {})
+                        status_icon = {
+                            "verified": "✅",
+                            "needs_review": "⚠️",
+                            "missing": "❌",
+                        }.get(final.get("status", ""), "❓")
+                        with st.expander(
+                            f"{status_icon} **{fname}**  →  `{final.get('value', 'MISSING')}`"
+                            f"  ·  conf={final.get('confidence', 0):.3f}"
+                            f"  ·  method={final.get('method', '?')}",
+                            expanded=False,
+                        ):
+                            # Anchor candidates
+                            st.markdown(
+                                f"**Anchor candidates** ({len(ft.get('anchor_candidates', []))} found):"
+                            )
+                            for i, c in enumerate(ft.get("anchor_candidates", [])):
+                                st.markdown(
+                                    f"  `{i + 1}`. value=`{c.get('raw_value')}` · "
+                                    f"conf=`{c.get('confidence')}` · page=`{c.get('page')}`"
+                                )
+                                st.caption(f"     snippet: {c.get('snippet', '')}")
+
+                            # Regex candidates
+                            st.markdown(
+                                f"**Regex candidates** ({len(ft.get('regex_candidates', []))} found):"
+                            )
+                            for i, c in enumerate(ft.get("regex_candidates", [])):
+                                st.markdown(
+                                    f"  `{i + 1}`. value=`{c.get('raw_value')}` · "
+                                    f"conf=`{c.get('confidence')}` · page=`{c.get('page')}`"
+                                )
+                                st.caption(f"     snippet: {c.get('snippet', '')}")
+
+                            # Scored ranking
+                            st.markdown("**Scored ranking (top 5):**")
+                            sc_df = pd.DataFrame(ft.get("scored_candidates", []))
+                            if not sc_df.empty:
+                                st.dataframe(
+                                    sc_df, use_container_width=True, hide_index=True
+                                )
+
+                            # Final result
+                            st.markdown("**Final result:**")
+                            fin = ft.get("final", {})
+                            st.json(fin)
+
+                            if fin.get("validation_errors"):
+                                st.error(
+                                    f"Validation errors: {fin['validation_errors']}"
+                                )
+
+                            # LayoutLM
+                            if ft.get("layoutlm"):
+                                lm = ft["layoutlm"]
+                                if lm.get("upgraded"):
+                                    st.success(
+                                        f"LayoutLM upgraded: {lm['before_conf']} → {lm['after_conf']}  new value=`{lm.get('new_value')}`"
+                                    )
+                                else:
+                                    st.info(
+                                        f"LayoutLM ran but did not improve (before={lm.get('before_conf')})"
+                                    )
+
+                            # LLM
+                            if ft.get("llm") and ft["llm"].get("triggered"):
+                                st.warning(
+                                    f"LLM fallback used → value=`{ft['llm'].get('value')}` conf={ft['llm'].get('confidence')}"
+                                )
+
+                # ── Stage 5: LayoutLM summary ─────────────────────────────────
+                with st.expander("⑤ LayoutLM fallback summary", expanded=False):
+                    s4 = stages.get("4_layoutlm", {})
+                    st.write(f"Used: `{s4.get('used', False)}`")
+                    for fname, lf in (s4.get("fields") or {}).items():
+                        icon = (
+                            "🔼"
+                            if lf.get("upgraded")
+                            else ("🔁" if lf.get("triggered") else "⏭")
+                        )
+                        st.markdown(
+                            f"{icon} **{fname}**: triggered=`{lf.get('triggered')}` upgraded=`{lf.get('upgraded', False)}`"
+                        )
+
+                # ── Stage 6: Validation ───────────────────────────────────────
+                with st.expander("⑥ Validation summary", expanded=False):
+                    s6 = stages.get("6_validation", {})
+                    c1, c2 = st.columns(2)
+                    c1.metric(
+                        "Required fields present",
+                        "✅ Yes" if s6.get("required_present") else "❌ No",
+                    )
+                    c2.metric(
+                        "Overall confidence", f"{s6.get('overall_confidence', 0):.3f}"
+                    )
+                    if s6.get("required_missing"):
+                        st.error(f"Missing required: {s6['required_missing']}")
+                    if s6.get("cross_field_errors"):
+                        st.warning(f"Cross-field errors: {s6['cross_field_errors']}")

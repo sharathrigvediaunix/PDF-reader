@@ -1,58 +1,81 @@
 profile_id: grainger_summary_bill_v1
 vendor:
-  name_contains: ["Grainger", "S_SUMMBILL@grainger.com"]
+  name_contains: ["Grainger", "S_SUMMBILL@grainger.com", "SUMMARY BILL INVOICE"]
 doc_types: ["summary_bill"]
 
 normalization:
   prefer_pdf_text: true
-  ocr_fallback: "tesseract"  # often these PDFs are text-rich; tesseract ok as fallback
+  ocr_fallback: paddleocr
 
 global_rules:
   dedupe:
     normalize_case: true
     strip_spaces: true
   pagination:
-    # You will extract many repeated invoice blocks across pages.
     treat_each_invoice_block_as_record: true
 
 fields_single:
   summary_bill_number:
-    anchors: ["SUMMARY BILL INVOICE", "SUMMARY BILL NUMBER"]
-    direction: ["right", "below"]
-    window: { x: 400, y: 120 }
+    anchors: ["SUMMARY BILL INVOICE", "SUMMARY BILL NUMBER", "BILL NUMBER"]
+    direction: ["right", "below", "left"]
+    window: { x: 600, y: 60 }
     patterns:
-      - '\b\d{10}\b'          # 7135182082 :contentReference[oaicite:18]{index=18}
-    dedupe: true
+      - '\b\d{10}\b'
+    normalize: "strip"
 
   summary_date_from:
     anchors: ["Date from"]
-    direction: ["right", "below"]
-    window: { x: 250, y: 120 }
+    direction: ["below", "right"]
+    window: { x: 300, y: 60 }
     patterns:
-      - '\b\d{2}\/\d{2}\/\d{4}\b'  # 01/01/2026 :contentReference[oaicite:19]{index=19}
+      - '\b\d{2}\/\d{2}\/\d{4}\b'
     normalize: "date_mm/dd/yyyy"
 
   summary_date_to:
     anchors: ["Date to"]
-    direction: ["right", "below"]
-    window: { x: 250, y: 120 }
+    direction: ["below", "right"]
+    window: { x: 300, y: 60 }
     patterns:
-      - '\b\d{2}\/\d{2}\/\d{4}\b'  # 01/15/2026 :contentReference[oaicite:20]{index=20}
+      - '\b\d{2}\/\d{2}\/\d{4}\b'
     normalize: "date_mm/dd/yyyy"
 
   summary_total_pay_amount:
     anchors: ["PLEASE PAY THIS AMOUNT"]
     direction: ["right", "below"]
-    window: { x: 350, y: 120 }
+    window: { x: 700, y: 60 }
     patterns:
-      - '\$\s*[0-9,]+\.\d{2}'      # $ 33,878.12 :contentReference[oaicite:21]{index=21}
+      - '[0-9,]+\.\d{2}'
+    normalize: "money"
+
+  net_invoice_amount:
+    anchors: ["NET INVOICE AMOUNT"]
+    direction: ["right", "below"]
+    window: { x: 700, y: 40 }
+    patterns:
+      - '[0-9,]+\.\d{2}'
+    normalize: "money"
+
+  shipping_charges:
+    anchors: ["SHIPPING CHARGES"]
+    direction: ["right", "below"]
+    window: { x: 700, y: 40 }
+    patterns:
+      - '[0-9,]+\.\d{2}'
+    normalize: "money"
+
+  tax_amount:
+    anchors: ["TAX"]
+    direction: ["right", "below"]
+    window: { x: 700, y: 40 }
+    patterns:
+      - '[0-9,]+\.\d{2}'
     normalize: "money"
 
 records:
-  # Key part: this document contains MANY invoice blocks.
   invoice_blocks:
     start_anchors:
       - "PURCHASE ORDER #:"
+      - "PURCHASE ORDER #"
       - "ACCOUNT #"
       - "INVOICE #"
       - "INV DATE"
@@ -60,71 +83,71 @@ records:
     end_anchors:
       - "TOTAL FOR PURCHASE ORDER #"
       - "SUMMARY BILL NUMBER"
+
     record_id:
-      # Each block is keyed by PO + invoice #, both appear in each block. :contentReference[oaicite:22]{index=22}
       anchors: ["PURCHASE ORDER #", "INVOICE #"]
       patterns:
-        - '\b\d{6}\b'      # PO like 461155 etc :contentReference[oaicite:23]{index=23}
-        - '\b\d{10}\b'     # invoice # like 9757329207 :contentReference[oaicite:24]{index=24}
+        - '\b\d{6}\b'
+        - '\b\d{10}\b'
 
     fields_single:
       po_number:
-        anchors: ["PURCHASE ORDER #"]
+        anchors: ["PURCHASE ORDER #:", "PURCHASE ORDER #", "PO#:"]
         direction: ["right", "below"]
-        window: { x: 200, y: 80 }
-        patterns: ['\b\d{6}\b']      # 461155 etc :contentReference[oaicite:25]{index=25}
+        window: { x: 400, y: 60 }
+        patterns: ['\b\d{6}\b']
 
       account_number:
         anchors: ["ACCOUNT #"]
         direction: ["right", "below"]
-        window: { x: 200, y: 80 }
-        patterns: ['\b\d{9}\b']      # 804433613 :contentReference[oaicite:26]{index=26}
+        window: { x: 300, y: 60 }
+        patterns: ['\b\d{9}\b']
 
       invoice_number:
         anchors: ["INVOICE #"]
         direction: ["right", "below"]
-        window: { x: 250, y: 80 }
-        patterns: ['\b\d{10}\b']     # 9757329207 :contentReference[oaicite:27]{index=27}
+        window: { x: 300, y: 60 }
+        patterns: ['\b\d{10}\b']
 
       invoice_date:
         anchors: ["INV DATE"]
         direction: ["right", "below"]
-        window: { x: 200, y: 80 }
-        patterns: ['\b\d{2}\/\d{2}\/\d{4}\b']  # 01/02/2026 :contentReference[oaicite:28]{index=28}
+        window: { x: 300, y: 60 }
+        patterns: ['\b\d{2}\/\d{2}\/\d{4}\b']
         normalize: "date_mm/dd/yyyy"
 
       order_number:
         anchors: ["ORDER #"]
         direction: ["right", "below"]
-        window: { x: 250, y: 80 }
-        patterns: ['\b\d{10}\b']     # 1567054158 :contentReference[oaicite:29]{index=29}
+        window: { x: 300, y: 60 }
+        patterns: ['\b\d{10}\b']
 
       net_amount:
         anchors: ["NET AMOUNT"]
         direction: ["right", "below"]
-        window: { x: 250, y: 80 }
-        patterns: ['\b[0-9,]+\.\d{2}\b']   # 44.88 etc :contentReference[oaicite:30]{index=30}
+        window: { x: 500, y: 40 }
+        patterns: ['\b[0-9,]+\.\d{2}\b']
         normalize: "money"
 
       shipping_amount:
         anchors: ["SHIPPING"]
         direction: ["right", "below"]
-        window: { x: 250, y: 80 }
-        patterns: ['\b[0-9,]+\.\d{2}\b']   # 0.00, 55.00 etc :contentReference[oaicite:31]{index=31}
+        window: { x: 500, y: 40 }
+        patterns: ['\b[0-9,]+\.\d{2}\b']
         normalize: "money"
 
       tax_amount:
         anchors: ["TAX"]
         direction: ["right", "below"]
-        window: { x: 250, y: 80 }
+        window: { x: 500, y: 40 }
         patterns: ['\b[0-9,]+\.\d{2}\b']
         normalize: "money"
 
       total_invoice_amount:
         anchors: ["TOTAL INVOICE"]
         direction: ["right", "below"]
-        window: { x: 250, y: 80 }
-        patterns: ['\b[0-9,]+\.\d{2}\b']   # 48.59 etc :contentReference[oaicite:32]{index=32}
+        window: { x: 500, y: 40 }
+        patterns: ['\b[0-9,]+\.\d{2}\b']
         normalize: "money"
 
     fields_multi:
@@ -135,28 +158,27 @@ records:
         mode: "extract_all"
         split_on: [",", " "]
         patterns:
-          - '\b\d{9,15}\b'            # e.g., 490478564594 :contentReference[oaicite:33]{index=33}
+          - '\b\d{9,15}\b'
         dedupe: true
 
       delivery_numbers:
         anchors: ["Delivery #", "Delivery #:"]
         direction: ["right", "below"]
-        window: { x: 250, y: 120 }
+        window: { x: 400, y: 120 }
         mode: "extract_all"
         patterns:
-          - '\b\d{10}\b'              # e.g., 6697151252 :contentReference[oaicite:34]{index=34}
+          - '\b\d{10}\b'
         dedupe: true
 
     tables:
       line_items:
-        # Each block has a line-item table with headings: PO LINE#, QUANTITY, ITEM#, DESCRIPTION, UNIT PRICE, TOTAL PRICE :contentReference[oaicite:35]{index=35}
         start_anchors: ["PO LINE#", "QUANTITY", "ITEM#", "DESCRIPTION", "UNIT PRICE", "TOTAL PRICE"]
         end_anchors: ["TOTAL FOR PURCHASE ORDER #", "SHIP TO:", "PO#:"]
         row_mode: "by_line_y_cluster"
         columns:
           po_line:      { type: "int" }
           quantity:     { type: "int" }
-          item_number:  { type: "string" }   # often like 6P757, 24T316 :contentReference[oaicite:36]{index=36}
+          item_number:  { type: "string" }
           description:  { type: "string" }
           unit_price:   { type: "money" }
           total_price:  { type: "money" }

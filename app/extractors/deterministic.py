@@ -4,15 +4,22 @@ Deterministic extraction engine.
 2. Regex extraction over full text (fallback)
 3. Candidate scoring: method_weight + ocr_conf + parse_success + validator_bonus
 """
+
 import re
 from difflib import SequenceMatcher
 from typing import Any, Optional
 
 from app.config.loader import FieldConfig, DocumentConfig
 from app.models import (
-    NormalizedDocument, Token, BBox,
-    FieldResult, FieldCandidate, ExtractionMethod,
-    SourceLocation, Evidence, ExtractionStatus,
+    NormalizedDocument,
+    Token,
+    BBox,
+    FieldResult,
+    FieldCandidate,
+    ExtractionMethod,
+    SourceLocation,
+    Evidence,
+    ExtractionStatus,
 )
 from app.extractors.spatial import spatial_search
 from app.logging_config import get_logger
@@ -31,11 +38,11 @@ ANCHOR_FUZZY_THRESHOLD = 0.80
 
 # Map search_window config values to spatial strategy names
 SEARCH_WINDOW_MAP = {
-    "same_line_right":   "right_only",
+    "same_line_right": "right_only",
     "same_line_or_next": "right_then_below",
-    "next_3_lines":      "below_then_right",
-    "full_text":         "any",
-    "any":               "any",
+    "next_3_lines": "below_then_right",
+    "full_text": "any",
+    "any": "any",
 }
 
 
@@ -111,6 +118,8 @@ def anchor_extract(
                     tokens=tokens,
                     page_no=page.page_no,
                     strategy=spatial_strategy,
+                    window=field_config.window,
+                    patterns=field_config.compiled_patterns,
                 )
 
                 if not value_tokens:
@@ -135,23 +144,27 @@ def anchor_extract(
 
                 # Context snippet
                 ctx_start = max(0, i - 2)
-                ctx_tokens = tokens[ctx_start: i + matched_span + len(cleaned_tokens)]
+                ctx_tokens = tokens[ctx_start : i + matched_span + len(cleaned_tokens)]
                 snippet = " ".join(t.text for t in ctx_tokens)
 
                 # Base confidence: method weight × anchor match × OCR confidence
-                base_conf = METHOD_WEIGHTS[ExtractionMethod.ANCHOR] * match_score * ocr_conf
+                base_conf = (
+                    METHOD_WEIGHTS[ExtractionMethod.ANCHOR] * match_score * ocr_conf
+                )
 
-                candidates.append(FieldCandidate(
-                    value=raw_value,
-                    raw_value=raw_value,
-                    confidence=base_conf,
-                    method=ExtractionMethod.ANCHOR,
-                    source=SourceLocation(
-                        page=page.page_no,
-                        bbox=best_bb.to_dict() if best_bb else None,
-                    ),
-                    evidence=Evidence(snippet=snippet),
-                ))
+                candidates.append(
+                    FieldCandidate(
+                        value=raw_value,
+                        raw_value=raw_value,
+                        confidence=base_conf,
+                        method=ExtractionMethod.ANCHOR,
+                        source=SourceLocation(
+                            page=page.page_no,
+                            bbox=best_bb.to_dict() if best_bb else None,
+                        ),
+                        evidence=Evidence(snippet=snippet),
+                    )
+                )
 
     logger.debug("anchor_candidates", field=field_config.name, count=len(candidates))
     return candidates
@@ -179,19 +192,21 @@ def regex_extract(
                 continue
 
             bbox, page_no = _find_token_bbox(doc, raw_value)
-            snippet = full_text[max(0, match.start() - 40): match.end() + 40]
+            snippet = full_text[max(0, match.start() - 40) : match.end() + 40]
 
-            candidates.append(FieldCandidate(
-                value=raw_value,
-                raw_value=raw_value,
-                confidence=METHOD_WEIGHTS[ExtractionMethod.REGEX],
-                method=ExtractionMethod.REGEX,
-                source=SourceLocation(
-                    page=page_no,
-                    bbox=bbox.to_dict() if bbox else None,
-                ),
-                evidence=Evidence(snippet=snippet.strip()),
-            ))
+            candidates.append(
+                FieldCandidate(
+                    value=raw_value,
+                    raw_value=raw_value,
+                    confidence=METHOD_WEIGHTS[ExtractionMethod.REGEX],
+                    method=ExtractionMethod.REGEX,
+                    source=SourceLocation(
+                        page=page_no,
+                        bbox=bbox.to_dict() if bbox else None,
+                    ),
+                    evidence=Evidence(snippet=snippet.strip()),
+                )
+            )
 
     logger.debug("regex_candidates", field=field_config.name, count=len(candidates))
     return candidates
@@ -210,7 +225,9 @@ def _find_token_bbox(doc: NormalizedDocument, text: str) -> tuple[Optional[BBox]
                 all_match = True
                 for j, w in enumerate(words[1:], 1):
                     if i + j < len(page.tokens):
-                        if page.tokens[i + j].text.lower().strip("$,.") == w.strip("$,."):
+                        if page.tokens[i + j].text.lower().strip("$,.") == w.strip(
+                            "$,."
+                        ):
                             match_bboxes.append(page.tokens[i + j].bbox)
                         else:
                             all_match = False

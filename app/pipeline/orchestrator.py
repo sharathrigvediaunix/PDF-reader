@@ -67,7 +67,10 @@ def run_extraction_pipeline(
     """
     settings = get_settings()
     log = logger.bind(job_id=job_id, document_id=document_id)
-    debug_trace: dict = {}
+    debug_trace: dict = {
+        "stages": {},  # keyed by stage name, each has its own data
+        "fields": {},  # keyed by field name
+    }
 
     try:
         # ── 1. Upload original file ────────────────────────────────────────────
@@ -80,6 +83,33 @@ def run_extraction_pipeline(
         log.info("normalization_start")
         norm_doc = normalize_document(file_bytes, document_id, filename)
         log.info("normalization_done", pages=len(norm_doc.pages))
+
+        # Capture normalization output in trace
+        norm_pages_trace = []
+        for page in norm_doc.pages:
+            norm_pages_trace.append(
+                {
+                    "page_no": page.page_no,
+                    "ocr_used": page.ocr_used,
+                    "token_count": len(page.tokens),
+                    "layout_lines": len(page.layout_lines),
+                    "layout_columns": len(page.layout_columns),
+                    "full_text": page.full_text[:2000],  # first 2000 chars
+                    "tokens_sample": [
+                        {
+                            "text": t.text,
+                            "bbox": t.bbox.to_dict(),
+                            "conf": round(t.conf, 3),
+                        }
+                        for t in page.tokens[:100]  # first 100 tokens
+                    ],
+                }
+            )
+        debug_trace["stages"]["1_normalization"] = {
+            "pages": len(norm_doc.pages),
+            "ocr_used": any(p.ocr_used for p in norm_doc.pages),
+            "page_detail": norm_pages_trace,
+        }
 
         # Upload OCR outputs for scanned pages
         for page in norm_doc.pages:
@@ -121,21 +151,69 @@ def run_extraction_pipeline(
                 log.info("party_detected", party_id=party_id, confidence=party_conf)
             else:
                 log.info("party_not_detected_using_default")
+                party_conf = 0.0
+        else:
+            party_conf = 1.0
 
         norm_doc.party_id = supplier_id
+
+        debug_trace["stages"]["2_detection"] = {
+            "document_type": document_type,
+            "type_confidence": round(type_conf, 3),
+            "supplier_id": supplier_id,
+            "party_confidence": round(party_conf, 3),
+            "first_page_text": first_page_text[:2000],
+        }
 
         # ── 5. Load (doc_type × party) template ───────────────────────────────
         doc_config = load_config(document_type, supplier_id)
         log.info("template_loaded", doc_type=document_type, party=supplier_id)
 
-        # ── 6. Deterministic spatial extraction ───────────────────────────────
-        # Only extract the fields the user requested; if none specified, extract all
         fields_to_extract = doc_config.fields_for_request(requested_fields)
+
+        debug_trace["stages"]["3_template"] = {
+            "profile_id": doc_config.profile_id,
+            "all_blueprint_fields": doc_config.available_fields(),
+            "requested_fields": requested_fields,
+            "fields_to_extract": list(fields_to_extract.keys()),
+            "field_configs": {
+                fname: {
+                    "anchors": fc.anchors,
+                    "patterns": fc.patterns,
+                    "direction": fc.direction,
+                    "window": fc.window,
+                    "search_window": fc.search_window,
+                    "multi": fc.multi,
+                }
+                for fname, fc in fields_to_extract.items()
+            },
+        }
+
+        # ── 6. Deterministic spatial extraction ───────────────────────────────
         log.info("extraction_start", fields=list(fields_to_extract.keys()))
         extracted_fields: dict[str, FieldResult] = {}
 
+        from app.extractors.deterministic import (
+            anchor_extract,
+            regex_extract,
+            score_candidates,
+        )
+
         for fname, fconfig in fields_to_extract.items():
             log.debug("extracting_field", field=fname)
+
+            # Run anchor and regex separately so we can trace each
+            anchor_candidates = anchor_extract(norm_doc, fconfig)
+            regex_candidates = regex_extract(norm_doc, fconfig)
+            all_candidates = anchor_candidates + regex_candidates
+            scored = (
+                score_candidates(
+                    all_candidates, fconfig, normalize_value, validate_value
+                )
+                if all_candidates
+                else []
+            )
+
             fr = extract_field(
                 norm_doc,
                 fconfig,
@@ -147,28 +225,80 @@ def run_extraction_pipeline(
                 fr.validation_errors = errors
             extracted_fields[fname] = fr
 
-            debug_trace[fname] = {
-                "method": fr.method.value if fr.method else None,
-                "confidence": fr.confidence,
-                "status": fr.status.value,
+            debug_trace["fields"][fname] = {
+                "anchor_candidates": [
+                    {
+                        "value": c.value,
+                        "raw_value": c.raw_value,
+                        "confidence": round(c.confidence, 4),
+                        "method": c.method.value,
+                        "snippet": c.evidence.snippet if c.evidence else "",
+                        "page": c.source.page if c.source else None,
+                        "bbox": c.source.bbox if c.source else None,
+                    }
+                    for c in anchor_candidates
+                ],
+                "regex_candidates": [
+                    {
+                        "value": c.value,
+                        "raw_value": c.raw_value,
+                        "confidence": round(c.confidence, 4),
+                        "snippet": c.evidence.snippet if c.evidence else "",
+                        "page": c.source.page if c.source else None,
+                    }
+                    for c in regex_candidates
+                ],
+                "scored_candidates": [
+                    {
+                        "value": c.value,
+                        "confidence": round(c.confidence, 4),
+                        "method": c.method.value,
+                    }
+                    for c in scored[:5]
+                ],
+                "final": {
+                    "value": fr.value,
+                    "confidence": round(fr.confidence, 4),
+                    "status": fr.status.value,
+                    "method": fr.method.value if fr.method else None,
+                    "snippet": fr.evidence.snippet if fr.evidence else "",
+                    "validation_errors": fr.validation_errors,
+                },
             }
 
         # ── 7. LayoutLM fallback ───────────────────────────────────────────────
         layoutlm_used = False
+        layoutlm_trace = {}
         for fname, fconfig in fields_to_extract.items():
             fr = extracted_fields[fname]
             if should_use_layoutlm(fr, fconfig):
                 log.info("layoutlm_fallback", field=fname, current_conf=fr.confidence)
                 fr2 = layoutlm_extract_field(norm_doc, fconfig, fr)
-                if fr2.confidence > fr.confidence:
+                upgraded = fr2.confidence > fr.confidence
+                layoutlm_trace[fname] = {
+                    "triggered": True,
+                    "before_conf": round(fr.confidence, 4),
+                    "after_conf": round(fr2.confidence, 4),
+                    "upgraded": upgraded,
+                    "new_value": fr2.value if upgraded else None,
+                }
+                if upgraded:
                     extracted_fields[fname] = fr2
-                    debug_trace[fname]["layoutlm_used"] = True
+                    debug_trace["fields"][fname]["layoutlm"] = layoutlm_trace[fname]
                     layoutlm_used = True
+            else:
+                layoutlm_trace[fname] = {
+                    "triggered": False,
+                    "reason": "confidence ok or fallback_allowed=False",
+                }
 
-        if layoutlm_used:
-            log.info("layoutlm_fallback_complete")
+        debug_trace["stages"]["4_layoutlm"] = {
+            "used": layoutlm_used,
+            "fields": layoutlm_trace,
+        }
 
         # ── 8. LLM fallback (if enabled) ──────────────────────────────────────
+        llm_trace = {}
         if settings.llm_fallback_enabled:
             llm_provider = get_llm_provider()
             for fname, fconfig in fields_to_extract.items():
@@ -179,7 +309,18 @@ def run_extraction_pipeline(
                         fr, fconfig, norm_doc, provider=llm_provider
                     )
                     extracted_fields[fname] = fr2
-                    debug_trace[fname]["llm_used"] = True
+                    llm_trace[fname] = {
+                        "triggered": True,
+                        "value": fr2.value,
+                        "confidence": round(fr2.confidence, 4),
+                    }
+                    debug_trace["fields"][fname]["llm"] = llm_trace[fname]
+                else:
+                    llm_trace[fname] = {"triggered": False}
+        debug_trace["stages"]["5_llm"] = {
+            "enabled": settings.llm_fallback_enabled,
+            "fields": llm_trace,
+        }
 
         # ── 9. Validation summary ──────────────────────────────────────────────
         summary = compute_validation_summary(extracted_fields, doc_config)
@@ -188,6 +329,13 @@ def run_extraction_pipeline(
             required_present=summary.required_present,
             overall_confidence=summary.overall_confidence,
         )
+
+        debug_trace["stages"]["6_validation"] = {
+            "required_present": summary.required_present,
+            "required_missing": summary.required_missing,
+            "overall_confidence": round(summary.overall_confidence, 4),
+            "cross_field_errors": summary.cross_field_errors,
+        }
 
         # ── 10. Drift detection ────────────────────────────────────────────────
         drift_report = _detect_drift(
@@ -211,13 +359,11 @@ def run_extraction_pipeline(
             drift_report=drift_report,
         )
 
-        if settings.debug:
-            debug_key = f"{document_id}/debug/debug_trace_{job_id}.json"
-            debug_url = upload_json(debug_key, debug_trace)
-            save_artifact_sync(
-                document_id, "debug_trace", debug_url, {"job_id": job_id}
-            )
-            result.debug_trace = debug_trace
+        # Always save debug trace — Streamlit pipeline inspector depends on it
+        debug_key = f"{document_id}/debug/debug_trace_{job_id}.json"
+        debug_url = upload_json(debug_key, debug_trace)
+        save_artifact_sync(document_id, "debug_trace", debug_url, {"job_id": job_id})
+        result.debug_trace = debug_trace
 
         save_field_results_sync(job_id, result)
         log.info("pipeline_complete", fields_extracted=len(extracted_fields))

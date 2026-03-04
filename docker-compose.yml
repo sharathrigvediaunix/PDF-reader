@@ -99,6 +99,7 @@ services:
         condition: service_healthy
 
   streamlit:
+    profiles: ["ui"]
     build:
       context: .
       dockerfile: Dockerfile

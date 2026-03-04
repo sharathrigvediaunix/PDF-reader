@@ -221,6 +221,44 @@ async def get_job_status(job_id: str):
     return response
 
 
+@router.get("/v1/jobs/{job_id}/trace")
+async def get_job_trace(job_id: str):
+    """
+    Return the full pipeline debug trace for a job.
+    Includes every stage: normalization tokens, OCR output, detection,
+    template config, per-field anchor/regex candidates, scoring, LayoutLM, LLM.
+    """
+    job = await get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+    if job.get("status") != "completed":
+        raise HTTPException(status_code=425, detail="Job not yet completed")
+
+    document_id = job.get("document_id")
+    artifacts = await get_artifacts(document_id)
+    trace_artifact = next(
+        (a for a in artifacts if a.get("kind") == "debug_trace"), None
+    )
+    if not trace_artifact:
+        raise HTTPException(status_code=404, detail="No debug trace found for this job")
+
+    # Fetch from MinIO — URL is stored as minio://bucket/object_key
+    from app.storage.minio_client import download_json
+    from app.settings import get_settings as _gs
+
+    bucket = _gs().minio_bucket
+    url = trace_artifact["url"]  # e.g. minio://docextract/abc123/debug/...
+    # Strip the minio://bucket/ prefix to get the object key
+    prefix = f"minio://{bucket}/"
+    object_key = url[len(prefix) :] if url.startswith(prefix) else url
+    try:
+        trace = download_json(object_key)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to load trace: {e}")
+
+    return trace
+
+
 @router.get("/v1/documents/{document_id}/result")
 async def get_document_result(document_id: str):
     result = await get_latest_result(document_id)
